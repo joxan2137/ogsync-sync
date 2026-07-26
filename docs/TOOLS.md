@@ -98,10 +98,12 @@ capture), `size?` (`WxH`, default 960x540). Returns image (MCP image content).
 hotspots/allocations as `name  ms|MB  %` lines, not raw dumps. `top` (default 25).
 
 ## input
-`actions`: array of `{type: key|click|move|scroll|device|network, ...}` —
+`actions`: array of `{type: key|click|move|scroll|device|network|nav, ...}` —
 `key {code, hold_ms?}`, `click {x,y,button?}`, `move {x,y,duration_ms?}`,
-`device {name|reset}` (device emulation), `network {profile}` (throttle).
-Requires active playtest for key/click. Returns per-action ack.
+`device {name|reset}` (device emulation), `network {profile}` (throttle),
+`nav {to: path|[x,y,z], timeout_ms?}` (walk character via Humanoid/PathfindingService,
+covers built-in MCP character_navigation). Requires active playtest for
+key/click/nav. Returns per-action ack.
 
 ## asset
 `op`: `search {query, category?, limit}`, `details {ids}`, `thumbnail {id}`,

@@ -31,19 +31,16 @@ AI agent framework for Roblox Studio. One binary, three jobs:
 
 ## Bridge protocol (daemon ⇄ plugin)
 
-JSON over HTTP, localhost. Plugin is always the HTTP client (Studio plugins may
-call localhost regardless of the game's HttpEnabled setting).
-
-- `POST /handshake` — plugin sends `{pluginVersion, placeId, placeName, sessionId}`.
-  Response: `{serverVersion, syncEnabled, projectName}`. Version mismatch ⇒
-  response carries `updatePlugin: true`.
-- `GET /pull?cursor=N&session=S` — long-poll (25 s timeout). Response:
-  `{cursor, jobs: [{id, op, args}]}`. Jobs are MCP tool ops and sync patches.
-- `POST /push` — plugin delivers `{results: [{id, ok, data|err}], events: [...]}`.
-  Events carry watcher notifications (script edited, instance added/removed,
-  playtest output, logs).
-- Payloads gzipped when > 16 KB (plugin uses `HttpService:RequestAsync` with
-  raw bodies; daemon handles both).
+Exact wire spec: `docs/PROTOCOL.md`. Summary: JSON over HTTP, loopback-only,
+plugin is always the client (Studio plugins ignore HttpEnabled; locally
+installed plugins skip permission prompts entirely). 25 s long-poll `GET /pull`
+delivering **batched** jobs (the community server delivers one request per
+0.5 s poll — its ~2 req/s ceiling is a key weakness we remove), `POST /push`
+for results + watcher events, `POST /handshake` with proto/version negotiation.
+Play-mode clients cannot use HttpService even at plugin security level — the
+play-server plugin brokers client ops over a RemoteFunction
+(`ReplicatedStorage.__OGSyncBroker`); playtest stop is signaled cross-DataModel
+via `plugin:SetSetting`, not HTTP.
 
 Op execution on the plugin side is a dispatcher: `Ops/<Domain>.luau` modules
 keyed by op name. One job queue, results correlated by id. Long ops (playtest,
@@ -126,16 +123,55 @@ portable between sync files and tool output.
 ## Auto-install / auto-update
 
 - **Plugin install:** plugin `.rbxm` embedded in the binary at build time. On
-  daemon start: write to `%LOCALAPPDATA%/Roblox/Plugins/OGSync.rbxm` (mac:
-  `~/Documents/Roblox/Plugins`) when content hash differs. Studio hot-reloads
-  local plugin files.
-- **Binary update:** on start + every 6 h, GET
-  `api.github.com/repos/<owner>/ogsync/releases/latest` (ETag-cached, silent on
-  rate-limit). Newer semver ⇒ download platform asset, verify sha256 from
-  `checksums.txt`, swap: rename running exe → `.old`, write new, cleanup on
-  next boot. `ogsync update` forces it; `update.auto = false` in config opts out.
+  daemon start: byte-compare then write `OGSync.rbxm` into the Studio plugins
+  dir — Windows `%LOCALAPPDATA%/Roblox/Plugins`; mac tries
+  `~/Documents/Roblox/Plugins` then `~/Library/Application Support/Roblox/Plugins`
+  (whichever exists, else first); `OGSYNC_PLUGINS_DIR` overrides; Linux without
+  override ⇒ skip with notice, never error. If a connected session later
+  reports an older pluginVersion, daemon prints a "reload plugins in Studio"
+  notice (hot-reload of local plugin files is not guaranteed).
+- **Binary update:** Argon-pattern. State file `~/.ogsync/update.json`
+  (`lastChecked`, `etag`) throttles checks to 1/h; check on start + every 6 h
+  during serve. GET `api.github.com/repos/<owner>/ogsync/releases/latest` with
+  `If-None-Match`; 403/429/network ⇒ "unknown", never "no update"; optional
+  `GITHUB_TOKEN` honored. Newer semver ⇒ download platform asset, verify
+  sha256 against `checksums.txt`, swap via rename dance (Windows: rename
+  running exe → `ogsync.exe.old`, write new at original path, delete `.old`
+  on next boot; Unix: plain rename over). Update requires exe dir writable —
+  else print "reinstall via your package manager" and skip. `ogsync update`
+  forces; `update.auto=false` in `ogsync.toml` opts out.
 - **Version lockstep:** one version string (from package.json) stamped into
   binary and plugin at build; handshake enforces compatibility.
+
+## Tech decisions (research-locked, 2026-07-26)
+
+- **Runtime:** Bun **1.3.14 pinned** (CI + local). `bun build --compile`
+  targets: `bun-windows-x64-baseline`, `bun-linux-x64-baseline`,
+  `bun-darwin-arm64`. No `--bytecode` v1. Windows icon/metadata flags skipped
+  (can't cross-compile them).
+- **MCP SDK:** `@modelcontextprotocol/sdk@1.29.0` (v1 line) + zod v3. v2
+  (`@modelcontextprotocol/server`) stabilizes 2026-07-28 with unverified host
+  support — migrate later via codemod. stdout is JSON-RPC only: all logging to
+  stderr, EPIPE guard on stdout writes.
+- **HTTP hub:** `Bun.serve` (native), not node:http (Bun buffers outgoing
+  request bodies; irrelevant for serve but avoid the module wholesale).
+- **Plugin embedding:** `import pluginRbxm from "../assets/OGSync.rbxm" with
+  { type: "file" }` → read via `Bun.file(pluginRbxm)` ($bunfs virtual path —
+  never treat as real path).
+- **FS watcher:** hybrid — `fs.watch` fast path + 700 ms mtime polling sweep
+  as authority (Bun `fs.watch` on Windows has open recursive-watch issues).
+  Dirty paths union both sources; correctness never depends on fs.watch.
+- **Targets covered:** official archived MCP (6 tools), built-in Studio MCP
+  (script_*, execute_luau 3-context, screenshot, input, character_navigation →
+  our `input` nav action), community robloxstudio-mcp 88-tool surface.
+  Out of scope v1: Roblox-internal AI generation (generate_mesh/material/
+  procedural_model) — no public API; `create`+`asset`+`rbxm` are the
+  equivalents.
+- **Known pitfalls designed around:** Rojo 7.5 two-way sync echo loops (issue
+  #1273 — write-while-typing): we suppress echoes by hash and apply patches
+  via `ScriptEditorService:UpdateSourceAsync`; unbounded message queues (Rojo)
+  — ours drop acked jobs by cursor; version drift (community fork) — handshake
+  carries proto + semver and daemon rewrites the plugin file on update.
 
 ## Repo layout
 
@@ -162,6 +198,9 @@ docs/
 - `bun build --compile` → `ogsync-windows-x64.exe`, `ogsync-linux-x64`,
   `ogsync-darwin-arm64`. Plugin built with `rojo build plugin -o OGSync.rbxm`,
   embedded via generated `plugin_blob.ts` (base64) before compile.
-- `release.yml`: on push to main — if `package.json` version ≠ latest tag ⇒
-  create tag `vX.Y.Z` ⇒ matrix build ⇒ GitHub Release with binaries,
-  `OGSync.rbxm`, `checksums.txt`, generated notes.
+- `release.yml`: on push to main — job "check": `package.json` version ≠
+  latest tag ⇒ job "draft": create tag `vX.Y.Z` + **draft** release ⇒ matrix
+  build jobs upload assets into the draft (race-free) ⇒ job "publish": attach
+  self-generated `checksums.txt` (sha256 of every asset) and flip draft →
+  published. Assets: `ogsync-windows-x64.exe.zip`, `ogsync-linux-x64.zip`,
+  `ogsync-darwin-arm64.zip`, `OGSync.rbxm`, `checksums.txt`.
