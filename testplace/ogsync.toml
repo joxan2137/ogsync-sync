@@ -1,0 +1,14 @@
+# OGSync dev/test project — binds ONLY to the Place2 Studio instance.
+[project]
+name = "OGSyncTest"
+file = "default.project.json"
+
+[bind]
+target_place = "Place2"
+
+[sync]
+enabled = true
+conflict = "prefer-newest"
+
+[update]
+auto = false
