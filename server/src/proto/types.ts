@@ -226,7 +226,8 @@ export interface SnapshotEntry {
  * hash identical bytes.
  */
 export function normalizeSource(s: string): string {
-  return s.includes("\r") ? s.replaceAll("\r\n", "\n") : s;
+  if (!s.includes("\r")) return s;
+  return s.replaceAll("\r\n", "\n").replaceAll("\r", "\n");
 }
 
 /**

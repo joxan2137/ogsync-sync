@@ -37,6 +37,9 @@ jobs:
 
       - run: bun test
 
+      - name: Plugin tests
+        run: bun run test:plugin
+
       - name: Build plugin
         run: |
           mkdir -p dist

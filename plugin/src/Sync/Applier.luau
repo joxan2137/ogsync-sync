@@ -53,7 +53,8 @@ local function toLf(source: string): string
 	if string.find(source, "\r", 1, true) == nil then
 		return source
 	end
-	return (string.gsub(source, "\r\n", "\n"))
+	local lf = string.gsub(source, "\r\n", "\n")
+	return (string.gsub(lf, "\r", "\n"))
 end
 
 -- An open document holds edits that have not reached .Source yet; Watcher and
