@@ -124,6 +124,7 @@ export type BridgeErrorCode =
   | "TIMEOUT"    // op not answered in time
   | "NOPATH"     // instance path did not resolve
   | "BADARG"     // invalid arguments
+  | "AUTH"       // /rpc bearer token missing or wrong
   | "STUDIO";    // plugin-side execution error
 
 export class BridgeError extends Error {

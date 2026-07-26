@@ -1,0 +1,164 @@
+name: Release
+
+# Autorelease: a push to main whose package.json version has no matching v* tag
+# yet gets a tag + draft release, the matrix uploads its asset into the draft
+# (race-free), then publish attaches checksums.txt and flips the draft.
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  BUN_VERSION: "1.3.14"
+  GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  GH_REPO: ${{ github.repository }}
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      proceed: ${{ steps.version.outputs.proceed }}
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - id: version
+        name: Detect version change
+        run: |
+          version="$(jq -r .version package.json)"
+          tag="v$version"
+          latest="$(git tag -l 'v*' --sort=-v:refname | head -n 1)"
+          echo "package.json=$tag latest tag=${latest:-none}"
+          if git rev-parse -q --verify "refs/tags/$tag" >/dev/null; then
+            echo "$tag already released — nothing to do"
+            echo "proceed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "proceed=true" >> "$GITHUB_OUTPUT"
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+  draft:
+    needs: check
+    if: needs.check.outputs.proceed == 'true'
+    runs-on: ubuntu-latest
+    env:
+      TAG: ${{ needs.check.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Tag and open draft release
+        run: |
+          git tag "$TAG" "$GITHUB_SHA"
+          git push origin "refs/tags/$TAG"
+          gh release create "$TAG" \
+            --draft \
+            --target "$GITHUB_SHA" \
+            --title "$TAG" \
+            --generate-notes
+
+  build:
+    needs: [check, draft]
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: bun-linux-x64-baseline
+            asset: ogsync-linux-x64.zip
+          - os: ubuntu-latest
+            target: bun-darwin-arm64
+            asset: ogsync-darwin-arm64.zip
+          - os: windows-latest
+            target: bun-windows-x64-baseline
+            asset: ogsync-windows-x64.exe.zip
+    runs-on: ${{ matrix.os }}
+    env:
+      TAG: ${{ needs.check.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+
+      - uses: CompeyDev/setup-rokit@v0.1.2
+        with:
+          token: ${{ github.token }}
+
+      - run: bun install --frozen-lockfile
+
+      - run: bun run scripts/stamp-version.ts
+
+      - name: Build and embed plugin
+        run: |
+          mkdir -p dist
+          bun run build:plugin
+          bun run scripts/embed-plugin.ts
+
+      - run: bun run scripts/build-binaries.ts --only=${{ matrix.target }}
+
+      - name: Upload ${{ matrix.asset }}
+        run: gh release upload "$TAG" "dist/${{ matrix.asset }}" --clobber
+
+  plugin-asset:
+    needs: [check, draft]
+    runs-on: ubuntu-latest
+    env:
+      TAG: ${{ needs.check.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+
+      - uses: CompeyDev/setup-rokit@v0.1.2
+        with:
+          token: ${{ github.token }}
+
+      - name: Build plugin
+        run: |
+          mkdir -p dist
+          bun run scripts/stamp-version.ts
+          bun run build:plugin
+
+      - name: Upload OGSync.rbxm
+        run: gh release upload "$TAG" dist/OGSync.rbxm --clobber
+
+  publish:
+    needs: [check, draft, build, plugin-asset]
+    runs-on: ubuntu-latest
+    env:
+      TAG: ${{ needs.check.outputs.tag }}
+    steps:
+      - name: Collect draft assets
+        run: gh release download "$TAG" --dir assets
+
+      - name: Generate checksums.txt
+        working-directory: assets
+        run: |
+          for asset in ogsync-windows-x64.exe.zip ogsync-linux-x64.zip ogsync-darwin-arm64.zip OGSync.rbxm; do
+            test -f "$asset" || { echo "missing release asset: $asset" >&2; exit 1; }
+          done
+          sha256sum -- * > ../checksums.txt
+          cat ../checksums.txt
+
+      - name: Publish
+        run: |
+          gh release upload "$TAG" checksums.txt --clobber
+          gh release edit "$TAG" --draft=false
