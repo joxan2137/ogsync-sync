@@ -1,10 +1,10 @@
-# OGSync dev/test project — binds ONLY to the Place2 Studio instance.
+# OGSync dev/test project — binds ONLY to the designated test Studio instance.
 [project]
 name = "OGSyncTest"
 file = "default.project.json"
 
 [bind]
-target_place = "Place2"
+target_place = "Place1"
 
 [sync]
 enabled = true
