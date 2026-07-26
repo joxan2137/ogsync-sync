@@ -85,7 +85,7 @@ daemon renders `…more` cursors.
   (`run.exec` ctx=client, client logs) are delivered to the play-server
   session, which brokers to the target client over RemoteFunction
   `ReplicatedStorage.__OGSyncBroker` and relays results.
-- `play.stop` is signaled via `plugin:SetSetting("ogsync_stop", token)` from
+- `play.stop` is signaled via `plugin:SetSetting("ogsync_stop_token", token)` from
   the edit-mode plugin instance; play-mode instance watches the setting each
   Heartbeat (~0.5 s) and calls `StopAllPlayModeSolo`/equivalent. Daemon also
   marks the session stale.
