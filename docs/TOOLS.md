@@ -79,23 +79,31 @@ Covers smart/mass duplicate. Returns created paths compacted.
 Covers material search via `class=MaterialVariant` / prop queries.
 
 ## playtest
-`action`: `start` (`mode`=`solo`|`server`, `players`=N for multiplayer),
-`stop`, `status`. Status reports mode, uptime, player list, error count.
-Long op: start/stop ack ≤2s, readiness event pushed when simulation live.
+`action`: `start` (`mode`=`solo`|`server`), `stop`, `status`. Status reports
+mode, uptime and player list. Multi-client team test is not launchable from
+plugin APIs, so there is no `players` parameter; `solo` degrades to `server`
+(run mode) when Studio refuses play-solo, and the result says which started.
+Code inside a live playtest runs via `run` with `context=server|client`.
 
 ## logs
 `context` (`edit`|`server`|`client`|`all`, default `all`), `level`
 (`info`|`warn`|`error`, min), `since` (cursor from previous call), `pattern?`,
 `limit` (default 100). Output: `[ctx][level] message (xN)` — consecutive dupes
 collapsed with count. Returns next cursor.
+Served from the daemon's own buffer, fed by plugin log events from every
+connected session, so output survives a playtest ending and costs no Studio
+round trip. The first call for a context also backfills the plugin's ring
+buffer. A solo playtest shares one DataModel, so its client output arrives
+tagged `server`.
 
 ## screenshot
 `target` (`viewport` default), `camera_focus?` (path — frame instance before
 capture), `size?` (`WxH`, default 960x540). Returns image (MCP image content).
 
 ## profile
-`kind`: `micro` (frames=N), `script` (duration_s), `memory`. Returns top-N
+`kind`: `script` (`duration_s`, max 15), `memory`. Returns top-N
 hotspots/allocations as `name  ms|MB  %` lines, not raw dumps. `top` (default 25).
+MicroProfiler capture has no plugin API and is not exposed.
 
 ## input
 `actions`: array of `{type: key|click|move|scroll|device|network|nav, ...}` —

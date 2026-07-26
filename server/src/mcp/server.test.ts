@@ -94,9 +94,11 @@ describe("tool dispatch", () => {
         cursor: 7,
       })),
     );
+    // Backfilled entries are renumbered by the daemon buffer, so the cursor is
+    // the buffer's own sequence rather than whatever the plugin reported.
     const result = (await client.callTool({ name: "logs", arguments: {} })) as CallToolResult;
     expect(textOf(result)).toBe(
-      "[server][error] boom (x2)\n[server][info] ok\ncursor=7",
+      "[server][error] boom (x2)\n[server][info] ok\ncursor=3",
     );
   });
 
@@ -157,15 +159,31 @@ describe("tool dispatch", () => {
     );
   });
 
-  test("playtest stop also fires the cross-DataModel stop signal", async () => {
+  test("playtest stop reports success when the play session answers", async () => {
     const seen: OpName[] = [];
     const client = await connect(
       fakeBridge((op) => {
         seen.push(op);
-        return { state: "stopped" };
+        return { stopped: true };
       }),
     );
-    await client.callTool({ name: "playtest", arguments: { action: "stop" } });
-    expect(seen.sort()).toEqual(["play.stop", "play.stopSignal"]);
+    const result = (await client.callTool({ name: "playtest", arguments: { action: "stop" } })) as CallToolResult;
+    expect(textOf(result)).toContain("stopped");
+    // The SetSetting fallback is only for a play session that cannot answer.
+    expect(seen).toEqual(["play.stop"]);
+  });
+
+  test("playtest stop treats a lost play session as stopped, not as an error", async () => {
+    const seen: OpName[] = [];
+    const client = await connect(
+      fakeBridge((op) => {
+        seen.push(op);
+        if (op === "play.stop") throw new BridgeError("TIMEOUT", "no answer");
+        return {};
+      }),
+    );
+    const result = (await client.callTool({ name: "playtest", arguments: { action: "stop" } })) as CallToolResult;
+    expect(textOf(result)).toContain("stopped");
+    expect(seen).toEqual(["play.stop", "play.stopSignal"]);
   });
 });

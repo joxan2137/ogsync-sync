@@ -32,8 +32,19 @@ Long-poll, 25 s server timeout. Immediately returns queued jobs if any, else
 parks. On timeout → `204 No Content` (plugin re-polls immediately; on network
 error, backoff 1 s → ×1.5 → max 10 s).
 Response 200: `{cursor, jobs: [{id, op, args}]}` — **all** queued jobs, not one.
-`cursor` is a monotonically increasing ack counter; plugin echoes it back so
-daemon can drop acked jobs (redelivery on reconnect if unacked).
+`cursor` is a monotonically increasing per-session counter. The plugin stores it
+on receipt and echoes it on the next pull, which acks every job up to that
+point — delivery is at-most-once, not at-least-once: a job whose plugin-side
+handler dies is answered by the call's TIMEOUT, never redelivered (re-running
+`inst.delete` or `sync.apply` would be worse than failing).
+A cursor **above** the daemon's own counter is ignored and logged (stale plugin
+state after a daemon restart); both sides reset to 0 on every handshake.
+
+Only requests carrying `X-OGSync-Plugin: 1` reach these endpoints, and any
+request carrying `Origin` or `Sec-Fetch-*` is refused outright. Loopback is not
+a trust boundary — a web page the user visits can reach 127.0.0.1, but cannot
+set a custom header without a preflight the daemon never answers. Studio's
+`HttpService` sends the header and none of the browser metadata.
 
 ### POST /push
 Plugin → `{session, results?: [{id, ok: bool, data?, err?, partial?: bool}],
@@ -69,9 +80,10 @@ loopback-only, non-loopback bind refused (no override).
 `op` strings are namespaced: `inst.get`, `inst.set`, `inst.create`,
 `inst.delete`, `inst.duplicate`, `inst.find`, `inst.tree`, `script.read`,
 `script.edit`, `script.grep`, `run.exec`, `play.start`, `play.stop`,
-`play.status`, `log.tail`, `shot.capture`, `prof.micro`, `prof.script`,
-`prof.memory`, `input.batch`, `asset.op`, `rbxm.export`, `rbxm.import`,
-`hist.op`, `sel.get`, `sync.apply`, `sync.snapshot`, `sync.hash`.
+`play.stopSignal`, `play.status`, `log.tail`, `shot.capture`, `prof.micro`,
+`prof.script`, `prof.memory`, `input.batch`, `asset.op`, `rbxm.export`,
+`rbxm.import`, `hist.op`, `sel.get`, `sync.apply`, `sync.snapshot`,
+`sync.hash`, `sync.conflicts`.
 
 Args/results per op mirror docs/TOOLS.md param/output contracts; the daemon
 does arg validation + output formatting, the plugin returns raw structured
@@ -85,10 +97,13 @@ daemon renders `…more` cursors.
   (`run.exec` ctx=client, client logs) are delivered to the play-server
   session, which brokers to the target client over RemoteFunction
   `ReplicatedStorage.__OGSyncBroker` and relays results.
-- `play.stop` is signaled via `plugin:SetSetting("ogsync_stop_token", token)` from
-  the edit-mode plugin instance; play-mode instance watches the setting each
-  Heartbeat (~0.5 s) and calls `StopAllPlayModeSolo`/equivalent. Daemon also
-  marks the session stale.
+- `play.stop` routes to the play-server session, which calls `RunService:Stop()`.
+  Stopping tears down the session answering the job, so the daemon treats a
+  `TIMEOUT`/`NOPLUGIN` on that call as success. Fallback for a wedged play
+  session: `play.stopSignal` to the edit session writes
+  `plugin:SetSetting("ogsync_stop_token", <guid>)`, which the play-mode instance
+  polls every 0.5 s and acts on. Multi-client team test cannot be launched from
+  plugin APIs — `playtest` exposes solo and server modes only.
 
 ## Sync ops
 

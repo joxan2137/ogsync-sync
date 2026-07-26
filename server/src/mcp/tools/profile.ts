@@ -21,20 +21,19 @@ interface Hotspot {
 export const tool = defineTool({
   name: "profile",
   description:
-    "Profile the session: kind=micro (frames=N), script (duration_s) or memory. Returns the top `top` hotspots/allocations (default 25) as `name  ms|MB  %` lines instead of a raw dump.",
+    "Profile the session: kind=script samples running Luau for duration_s (max 15) or memory breaks down usage by tag. Returns the top `top` hotspots/allocations (default 25) as `name  ms|MB  %` lines instead of a raw dump.",
   schema: {
-    kind: z.enum(["micro", "script", "memory"]),
-    frames: z.number().int().positive().optional(),
-    duration_s: z.number().positive().optional(),
+    kind: z.enum(["script", "memory"]),
+    duration_s: z.number().positive().max(15).optional(),
     top: z.number().int().positive().optional(),
     timeout_ms: TIMEOUT_ARG,
   },
   async handler(bridge, _deps, args) {
     const top = args.top ?? 25;
-    const op = args.kind === "micro" ? "prof.micro" : args.kind === "script" ? "prof.script" : "prof.memory";
+    const op = args.kind === "script" ? "prof.script" : "prof.memory";
     const data = (await bridge.call(
       op,
-      { frames: args.frames, duration_s: args.duration_s, top },
+      { duration_s: args.duration_s, top },
       callOpts(args, LONG_TIMEOUT_MS),
     )) as ProfileResult;
 

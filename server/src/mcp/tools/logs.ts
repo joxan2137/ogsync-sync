@@ -1,5 +1,7 @@
 import { z } from "zod";
+import type { Role } from "@proto/types";
 import { capText, lines } from "../fmt.ts";
+import { logBufferFor, type LogLine } from "../logbuf.ts";
 import { callOpts, defineTool, TIMEOUT_ARG } from "../tool.ts";
 
 interface WireEntry {
@@ -8,26 +10,16 @@ interface WireEntry {
   m?: string;
 }
 
-interface LogEntry {
-  ctx: string;
-  level: string;
-  msg: string;
-  count: number;
-}
-
 interface LogResult {
-  ctx?: string;
+  ctx?: Role;
   entries?: WireEntry[];
-  cursor?: number;
-  truncated?: boolean;
-  pending?: number;
   dropped?: number;
 }
 
 export const tool = defineTool({
   name: "logs",
   description:
-    "Tail Studio and runtime output as `[ctx][level] message (xN)` lines, consecutive duplicates collapsed. Filter by context (edit|server|client|all), minimum level, regex pattern and `since` cursor; the trailing cursor= line feeds the next call.",
+    "Tail Studio and playtest output as `[ctx][level] message (xN)` lines, consecutive duplicates collapsed. Filter by context (edit|server|client|all), minimum level, regex pattern and `since` cursor; the trailing cursor= feeds the next call.",
   schema: {
     context: z.enum(["edit", "server", "client", "all"]).optional(),
     level: z.enum(["info", "warn", "error"]).optional(),
@@ -38,49 +30,64 @@ export const tool = defineTool({
     timeout_ms: TIMEOUT_ARG,
   },
   async handler(bridge, _deps, args) {
-    const since = args.since ?? args.cursor;
-    const data = (await bridge.call(
-      "log.tail",
-      {
-        context: args.context ?? "all",
-        level: args.level,
-        since,
-        pattern: args.pattern,
-        limit: args.limit ?? 100,
-      },
-      callOpts(args),
-    )) as LogResult;
+    const ctx = args.context ?? "all";
+    const buf = logBufferFor(bridge);
 
-    const ctx = data.ctx ?? args.context ?? "all";
-    const body = collapse(data.entries ?? [], ctx).map(
+    // Logs stream in as events; a first look at a context also pulls whatever
+    // the plugin buffered before the daemon attached.
+    if (buf.needsBackfill(ctx)) {
+      try {
+        const data = (await bridge.call(
+          "log.tail",
+          { context: ctx, limit: args.limit ?? 100 },
+          callOpts(args),
+        )) as LogResult;
+        const from = data.ctx ?? (ctx === "all" ? "edit" : (ctx as Role));
+        for (const e of data.entries ?? []) {
+          buf.push(from, e.l ?? "info", e.m ?? "", e.t ?? 0);
+        }
+      } catch {
+        // No session, or the op is unavailable in this context: event stream only.
+      }
+    }
+
+    const result = buf.query({
+      ctx,
+      minLevel: args.level,
+      pattern: args.pattern,
+      since: args.since ?? args.cursor,
+      limit: args.limit ?? 100,
+    });
+    const body = collapse(result.lines).map(
       (e) => `[${e.ctx}][${e.level}] ${e.msg}${e.count > 1 ? ` (x${e.count})` : ""}`,
     );
     const trailer = [
-      data.cursor === undefined ? undefined : `cursor=${data.cursor}`,
-      data.pending ? `pending=${data.pending}` : undefined,
-      data.dropped ? `dropped=${data.dropped}` : undefined,
+      `cursor=${result.cursor}`,
+      result.truncated ? "older lines dropped by limit" : undefined,
+      result.dropped ? `evicted=${result.dropped}` : undefined,
     ]
       .filter((b): b is string => b !== undefined)
       .join(" ");
-    return capText(
-      lines(body.length ? body : "no logs", trailer || undefined),
-      undefined,
-      data.cursor,
-    );
+    return capText(lines(body.length ? body : "no logs", trailer), undefined, result.cursor);
   },
 });
 
-/** Plugin streams one entry per line; collapsing dupes is the daemon's job. */
-function collapse(entries: WireEntry[], ctx: string): LogEntry[] {
-  const out: LogEntry[] = [];
+interface Collapsed {
+  ctx: string;
+  level: string;
+  msg: string;
+  count: number;
+}
+
+function collapse(entries: LogLine[]): Collapsed[] {
+  const out: Collapsed[] = [];
   for (const e of entries) {
-    const entry: LogEntry = { ctx, level: e.l ?? "info", msg: e.m ?? "", count: 1 };
     const prev = out[out.length - 1];
-    if (prev && prev.level === entry.level && prev.msg === entry.msg) {
+    if (prev && prev.level === e.level && prev.msg === e.msg && prev.ctx === e.ctx) {
       prev.count += 1;
       continue;
     }
-    out.push(entry);
+    out.push({ ctx: e.ctx, level: e.level, msg: e.msg, count: 1 });
   }
   return out;
 }
