@@ -49,6 +49,14 @@ Op execution on the plugin side is a dispatcher: `Ops/<Domain>.luau` modules
 keyed by op name. One job queue, results correlated by id. Long ops (playtest,
 profiling) stream partial results via events.
 
+**Session binding:** multiple Studio instances may connect (one session each).
+The daemon binds MCP ops and sync to exactly one session — chosen by
+`target_place` in `ogsync.toml` (matches placeName or placeId) or, when unset,
+the first connected session. Ops are never broadcast to all sessions. If the
+bound session is absent, tools return `ERR NOPLUGIN` rather than falling back
+to a different Studio instance. (Dev/testing on this machine: `target_place`
+must be `"Place2"`.)
+
 ## MCP tool surface (~20 tools)
 
 Design rules: batch-first (paths are arrays where sensible), field selection,
