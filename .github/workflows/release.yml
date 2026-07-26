@@ -73,20 +73,20 @@ jobs:
 
   build:
     needs: [check, draft]
+    # Every target cross-compiles from Linux: we use no Windows-only build flags
+    # (icon, hidden console), and the Windows runner fails to extract Bun's
+    # cross-compile runtime often enough to break releases.
     strategy:
       fail-fast: true
       matrix:
         include:
-          - os: ubuntu-latest
-            target: bun-linux-x64-baseline
+          - target: bun-linux-x64-baseline
             asset: ogsync-linux-x64.zip
-          - os: ubuntu-latest
-            target: bun-darwin-arm64
+          - target: bun-darwin-arm64
             asset: ogsync-darwin-arm64.zip
-          - os: windows-latest
-            target: bun-windows-x64-baseline
+          - target: bun-windows-x64-baseline
             asset: ogsync-windows-x64.exe.zip
-    runs-on: ${{ matrix.os }}
+    runs-on: ubuntu-latest
     env:
       TAG: ${{ needs.check.outputs.tag }}
     steps:

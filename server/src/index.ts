@@ -10,6 +10,7 @@ import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { basename, join } from "node:path";
 import type { Bridge, OgsyncConfig, SyncControl } from "./proto/types.ts";
 import { CONFIG_FILE, defaultConfigToml, loadConfig } from "./config.ts";
+import { formatChecks, runDoctor } from "./doctor.ts";
 import { log } from "./log.ts";
 import { Hub, ensureToken, type HealthResponse, type RpcHandler } from "./hub/hub.ts";
 import { RemoteBridge, detectExistingDaemon } from "./hub/proxy.ts";
@@ -35,6 +36,7 @@ commands:
   plugin [install|uninstall]
                            write or remove the Studio plugin file
   status [--port <n>]      query the local daemon's /health
+  doctor [--port <n>]      diagnose the project, plugin, daemon and Studio binding
   version                  print the version
 
 env: OGSYNC_PORT, OGSYNC_LOG=debug, OGSYNC_PLUGINS_DIR, GITHUB_TOKEN`;
@@ -66,6 +68,8 @@ async function main(): Promise<number> {
       return managePlugin(args);
     case "status":
       return status(args);
+    case "doctor":
+      return doctor(args);
     case "version":
       out(`ogsync ${VERSION}`);
       return 0;
@@ -171,6 +175,12 @@ async function status(args: Args): Promise<number> {
   }
   printHealth(daemon.health, port);
   return 0;
+}
+
+async function doctor(args: Args): Promise<number> {
+  const checks = await runDoctor(process.cwd(), portFlag(args) ?? undefined);
+  out(formatChecks(checks));
+  return checks.some((c) => c.level === "fail") ? 1 : 0;
 }
 
 function printHealth(health: HealthResponse, port: number): void {

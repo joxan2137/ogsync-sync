@@ -70,6 +70,8 @@ export interface HealthSession {
   session: string;
   role: Role;
   placeName: string;
+  placeId: number;
+  pluginVersion: string;
   /** Seconds since the last pull/push from this session. */
   age: number;
 }
@@ -500,6 +502,8 @@ export class Hub implements Bridge {
         session: info.session,
         role: info.role,
         placeName: info.placeName,
+        placeId: info.placeId,
+        pluginVersion: info.pluginVersion,
         age: Math.round((now - info.lastSeen) / 1000),
       })),
       bound: this.bound()?.session ?? null,
