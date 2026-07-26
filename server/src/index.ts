@@ -67,10 +67,10 @@ async function main(): Promise<number> {
     case "status":
       return status(args);
     case "version":
-      log.info(`ogsync ${VERSION}`);
+      out(`ogsync ${VERSION}`);
       return 0;
     case "help":
-      log.info(HELP);
+      out(HELP);
       return 0;
     default:
       log.error(`unknown command "${args.command}"`);
@@ -174,21 +174,29 @@ async function status(args: Args): Promise<number> {
 }
 
 function printHealth(health: HealthResponse, port: number): void {
-  log.info(`ogsync ${health.version} on 127.0.0.1:${port} (proto ${health.proto})`);
-  log.info(
+  out(`ogsync ${health.version} on 127.0.0.1:${port} (proto ${health.proto})`);
+  out(
     `sync: ${health.sync.enabled ? "enabled" : "disabled"} pending=${health.sync.pending} conflicts=${health.sync.conflicts}`,
   );
   if (health.sessions.length === 0) {
-    log.info("sessions: none — open the place in Studio with the OGSync plugin enabled");
+    out("sessions: none — open the place in Studio with the OGSync plugin enabled");
     return;
   }
-  log.info("sessions: (* = bound)");
+  out("sessions: (* = bound)");
   for (const session of health.sessions) {
     const marker = session.session === health.bound ? "*" : " ";
-    log.info(
+    out(
       `  ${marker} ${session.session.slice(0, 8)} ${session.role.padEnd(6)} ${session.placeName} last seen ${session.age}s ago`,
     );
   }
+}
+
+/**
+ * Human-facing CLI output for non-serve commands. Under `serve`, stdout is
+ * the MCP JSON-RPC channel and everything routes through log (stderr).
+ */
+function out(line: string): void {
+  process.stdout.write(line + "\n");
 }
 
 async function installStudioPlugin(): Promise<void> {
