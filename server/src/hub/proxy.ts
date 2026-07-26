@@ -65,11 +65,19 @@ export class RemoteBridge implements Bridge {
   }
 
   async call(op: OpName, args: unknown, opts: CallOpts = {}): Promise<unknown> {
-    return postRpc(this.port, this.token, {
-      op,
-      args: opts.player === undefined ? args : withPlayer(args, opts.player),
-      timeoutMs: opts.timeoutMs,
-    });
+    // Local deadline sits above the remote one so the owner's own TIMEOUT wins
+    // the race and we report the real cause.
+    const remote = opts.timeoutMs ?? 15_000;
+    return postRpc(
+      this.port,
+      this.token,
+      {
+        op,
+        args: opts.player === undefined ? args : withPlayer(args, opts.player),
+        timeoutMs: opts.timeoutMs,
+      },
+      remote + 5_000,
+    );
   }
 
   bound(): SessionInfo | null {
@@ -110,15 +118,25 @@ export class RemoteBridge implements Bridge {
   }
 }
 
-async function postRpc(port: number, token: string, body: object): Promise<unknown> {
+async function postRpc(
+  port: number,
+  token: string,
+  body: object,
+  timeoutMs = 30_000,
+): Promise<unknown> {
   let res: Response;
   try {
     res = await fetch(`http://127.0.0.1:${port}/rpc`, {
       method: "POST",
       headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
       body: JSON.stringify(body),
+      // An owner daemon that accepts and never answers must not hang us forever.
+      signal: AbortSignal.timeout(timeoutMs),
     });
   } catch (err) {
+    if (err instanceof Error && err.name === "TimeoutError") {
+      throw new BridgeError("TIMEOUT", `owner daemon on :${port} did not answer in ${timeoutMs}ms`);
+    }
     throw new BridgeError("NOPLUGIN", `owner daemon on :${port} is unreachable: ${message(err)}`);
   }
   const payload = (await res.json().catch(() => null)) as RpcResponse | { error?: string; code?: string } | null;
@@ -130,7 +148,7 @@ async function postRpc(port: number, token: string, body: object): Promise<unkno
   throw new BridgeError(code, payload?.error ?? `rpc failed with HTTP ${res.status}`);
 }
 
-const BRIDGE_ERROR_CODES: readonly BridgeErrorCode[] = ["NOPLUGIN", "TIMEOUT", "NOPATH", "BADARG", "STUDIO"];
+const BRIDGE_ERROR_CODES: readonly BridgeErrorCode[] = ["NOPLUGIN", "TIMEOUT", "NOPATH", "BADARG", "AUTH", "STUDIO"];
 
 function isBridgeErrorCode(value: unknown): value is BridgeErrorCode {
   return typeof value === "string" && (BRIDGE_ERROR_CODES as readonly string[]).includes(value);

@@ -36,11 +36,19 @@ import {
 import { ogsyncHome } from "../config.ts";
 import { log } from "../log.ts";
 
-const SESSION_TTL_MS = 30_000;
 const SWEEP_MS = 5_000;
 const DEFAULT_CALL_TIMEOUT_MS = 15_000;
+const MIN_CALL_TIMEOUT_MS = 1_000;
+const MAX_CALL_TIMEOUT_MS = 600_000;
 const MAX_BODY_BYTES = RESULT_CAP_BYTES * 2;
 const BEARER = "Bearer ";
+/** Studio sends this; a browser cannot without a preflight the hub never answers. */
+const PLUGIN_HEADER = "x-ogsync-plugin";
+const PLUGIN_ROUTES: ReadonlySet<string> = new Set([
+  "POST /handshake",
+  "GET /pull",
+  "POST /push",
+]);
 
 /** Ops whose args select a play-mode context; those go to the play-server session. */
 const RUNTIME_CONTEXT_OPS: ReadonlySet<OpName> = new Set<OpName>(["run.exec", "log.tail"]);
@@ -104,6 +112,8 @@ interface PendingCall {
   reject: (err: unknown) => void;
   onPartial?: (data: unknown) => void;
   timer: ReturnType<typeof setTimeout>;
+  /** Restarts the timeout so a streaming op is not killed mid-stream. */
+  rearm?: () => void;
 }
 
 class HttpError extends Error {
@@ -143,6 +153,7 @@ export class Hub implements Bridge {
   private readonly hostname: string;
   private readonly requestedPort: number;
   private readonly longPollMs: number;
+  private readonly sessionTtlMs: number;
   private readonly registry = new Map<string, SessionEntry>();
   private readonly calls = new Map<string, PendingCall>();
   private readonly listeners = new Set<(ev: BridgeEvent, from: SessionInfo) => void>();
@@ -158,6 +169,9 @@ export class Hub implements Bridge {
     this.hostname = opts.hostname ?? "127.0.0.1";
     this.requestedPort = opts.port ?? opts.config.daemon.port;
     this.longPollMs = opts.longPollMs ?? LONG_POLL_MS;
+    // A Studio main-thread stall must not outlive the park window plus slack,
+    // or a healthy session gets swept mid-poll.
+    this.sessionTtlMs = Math.max(30_000, this.longPollMs * 2);
     if (!isLoopbackHost(this.hostname)) {
       throw new Error(`refusing to bind ${this.hostname}: the hub is loopback-only and has no override`);
     }
@@ -170,6 +184,7 @@ export class Hub implements Bridge {
       port: this.requestedPort,
       // Must outlast a parked long-poll or Bun closes the socket mid-park.
       idleTimeout: Math.min(255, Math.ceil(this.longPollMs / 1000) + 10),
+      maxRequestBodySize: MAX_BODY_BYTES,
       fetch: (req, server) => this.handle(req, server),
       error: (err: Error) => {
         log.error("hub request failed:", err);
@@ -206,15 +221,28 @@ export class Hub implements Bridge {
 
   async call(op: OpName, args: unknown, opts: CallOpts = {}): Promise<unknown> {
     const entry = this.route(op, args);
-    const id = `${Date.now().toString(36)}${(this.jobCounter += 1).toString(36)}`;
-    const timeoutMs = opts.timeoutMs ?? DEFAULT_CALL_TIMEOUT_MS;
+    // Job ids must be unguessable: a result carrying a foreign id would
+    // otherwise be a way to answer another client's call.
+    const id = crypto.randomUUID();
+    const timeoutMs = clampTimeout(opts.timeoutMs);
     const job: Job = { id, op, args: withPlayer(args, opts.player) };
     return new Promise<unknown>((resolve, reject) => {
-      const timer = setTimeout(() => {
+      const expire = () => {
         this.dropQueuedJob(entry, id);
         this.failCall(id, new BridgeError("TIMEOUT", `${op} not answered in ${timeoutMs}ms`));
-      }, timeoutMs);
-      this.calls.set(id, { session: entry.info.session, resolve, reject, onPartial: opts.onPartial, timer });
+      };
+      const call: PendingCall = {
+        session: entry.info.session,
+        resolve,
+        reject,
+        onPartial: opts.onPartial,
+        timer: setTimeout(expire, timeoutMs),
+        rearm: () => {
+          clearTimeout(call.timer);
+          call.timer = setTimeout(expire, timeoutMs);
+        },
+      };
+      this.calls.set(id, call);
       this.enqueue(entry, job);
     });
   }
@@ -287,6 +315,25 @@ export class Hub implements Bridge {
     }
     const url = new URL(req.url);
     const route = `${req.method} ${url.pathname}`;
+    // Loopback is not a trust boundary: any page the user visits can fetch
+    // 127.0.0.1. Browsers cannot omit Origin on cross-site requests, cannot
+    // send Sec-Fetch-Site: same-origin to another origin, and cannot set a
+    // custom header without a preflight we never answer. Studio's
+    // HttpService sends none of the three.
+    const browserish =
+      req.headers.get("origin") !== null ||
+      req.headers.get("sec-fetch-site") !== null ||
+      req.headers.get("sec-fetch-mode") !== null;
+    if (browserish && route !== "GET /health") {
+      log.warn(`refused browser-originated ${route} (origin ${req.headers.get("origin") ?? "-"})`);
+      return this.json({ error: "browser requests are not accepted", code: "FORBIDDEN" }, 403);
+    }
+    if (PLUGIN_ROUTES.has(route) && req.headers.get(PLUGIN_HEADER) !== PROTO_VERSION.toString()) {
+      return this.json(
+        { error: `plugin endpoints require ${PLUGIN_HEADER}: ${PROTO_VERSION}`, code: "FORBIDDEN" },
+        403,
+      );
+    }
     try {
       switch (route) {
         case "POST /handshake":
@@ -309,6 +356,10 @@ export class Hub implements Bridge {
   }
 
   private async body<T>(req: Request): Promise<T> {
+    const declared = Number(req.headers.get("content-length") ?? "0");
+    if (Number.isFinite(declared) && declared > MAX_BODY_BYTES) {
+      throw new HttpError(413, "TOOBIG", `body exceeds ${MAX_BODY_BYTES} bytes`);
+    }
     const raw = await req.text();
     if (Buffer.byteLength(raw) > MAX_BODY_BYTES) {
       throw new HttpError(413, "TOOBIG", `body exceeds ${MAX_BODY_BYTES} bytes`);
@@ -332,6 +383,12 @@ export class Hub implements Bridge {
       return { ...base, accepted: false, reason: `proto ${req.proto} unsupported, daemon speaks ${PROTO_VERSION}`, updatePlugin: true, syncEnabled: false };
     }
     if (typeof req.session !== "string" || req.session === "") return reject("missing session id");
+    if (req.role !== "edit" && req.role !== "server" && req.role !== "client") {
+      return reject(`unknown role ${String(req.role)}`);
+    }
+    if (typeof req.placeName !== "string" || typeof req.placeId !== "number") {
+      return reject("handshake needs placeName (string) and placeId (number)");
+    }
     if (!this.matchesTarget(req)) {
       return reject(`place ${describePlace(req)} does not match target_place ${String(this.config.bind.target_place)}`);
     }
@@ -340,6 +397,18 @@ export class Hub implements Bridge {
         entry.info.session !== req.session && entry.info.role === req.role && placeKey(entry.info) === placeKey(req),
     );
     if (taken) return reject(`another ${req.role} session is already bound to ${describePlace(req)}`);
+    // With no target_place configured, first edit session wins outright —
+    // otherwise sync would silently pick whichever place handshook first.
+    if (this.config.bind.target_place === null && req.role === "edit") {
+      const otherEdit = [...this.registry.values()].find(
+        (entry) => entry.info.role === "edit" && entry.info.session !== req.session,
+      );
+      if (otherEdit) {
+        return reject(
+          `daemon is bound to ${describePlace(otherEdit.info)}; set bind.target_place in ogsync.toml to choose a place`,
+        );
+      }
+    }
 
     const existing = this.registry.get(req.session);
     const now = Date.now();
@@ -352,8 +421,19 @@ export class Hub implements Bridge {
       connectedAt: existing?.info.connectedAt ?? now,
       lastSeen: now,
     };
-    if (existing) existing.info = info;
-    else this.registry.set(req.session, { info, queue: [], seq: 0, waiter: null });
+    if (existing) {
+      // A re-handshake means the plugin restarted its loop at cursor 0; keeping
+      // the old queue would redeliver jobs it already ran.
+      this.releaseWaiter(existing);
+      for (const queued of existing.queue) {
+        this.failCall(queued.job.id, new BridgeError("NOPLUGIN", "session re-handshook before the job ran"));
+      }
+      existing.queue = [];
+      existing.seq = 0;
+      existing.info = info;
+    } else {
+      this.registry.set(req.session, { info, queue: [], seq: 0, waiter: null });
+    }
 
     log.info(`session ${short(req.session)} ${req.role} ${describePlace(req)} plugin ${req.pluginVersion}`);
     if (updatePlugin) {
@@ -372,9 +452,13 @@ export class Hub implements Bridge {
     const entry = this.requireSession(url.searchParams.get("session"));
     entry.info.lastSeen = Date.now();
 
+    // A cursor beyond our own seq means the plugin kept state across a daemon
+    // restart; honoring it would filter out every job we ever enqueue.
     const cursor = Number(url.searchParams.get("cursor") ?? "0");
-    if (Number.isFinite(cursor) && cursor > 0) {
+    if (Number.isFinite(cursor) && cursor > 0 && cursor <= entry.seq) {
       entry.queue = entry.queue.filter((queued) => queued.seq > cursor);
+    } else if (cursor > entry.seq) {
+      log.warn(`session ${short(entry.info.session)} sent cursor ${cursor} > seq ${entry.seq}; ignoring ack`);
     }
     this.releaseWaiter(entry);
     if (entry.queue.length > 0) return this.jobsResponse(entry);
@@ -395,7 +479,7 @@ export class Hub implements Bridge {
   private push(body: PushRequest): Response {
     const entry = this.requireSession(body.session);
     entry.info.lastSeen = Date.now();
-    for (const result of body.results ?? []) this.settle(result);
+    for (const result of body.results ?? []) this.settle(result, entry);
     for (const ev of body.events ?? []) this.dispatch(ev, entry);
     return this.json({ ok: true });
   }
@@ -491,10 +575,15 @@ export class Hub implements Bridge {
     entry.queue = entry.queue.filter((queued) => queued.job.id !== id);
   }
 
-  private settle(result: JobResult): void {
+  private settle(result: JobResult, from: SessionEntry): void {
     const call = this.calls.get(result.id);
     if (!call) {
       log.debug(`result for unknown job ${result.id}`);
+      return;
+    }
+    // Only the session the job was dispatched to may answer it.
+    if (call.session !== from.info.session) {
+      log.warn(`session ${short(from.info.session)} answered job ${result.id} it does not own`);
       return;
     }
     const size = payloadSize(result.data);
@@ -504,6 +593,7 @@ export class Hub implements Bridge {
     }
     if (result.partial === true) {
       call.onPartial?.(result.data);
+      call.rearm?.();
       return;
     }
     clearTimeout(call.timer);
@@ -551,10 +641,12 @@ export class Hub implements Bridge {
   }
 
   private sweep(): void {
-    const cutoff = Date.now() - SESSION_TTL_MS;
+    const cutoff = Date.now() - this.sessionTtlMs;
     for (const entry of [...this.registry.values()]) {
-      if (entry.info.lastSeen >= cutoff) continue;
-      this.dropSession(entry.info.session, `expired after ${SESSION_TTL_MS / 1000}s without a pull`);
+      // A parked poll is proof of life even though lastSeen is not refreshed
+      // until it returns; sweeping it would drop a healthy session's queue.
+      if (entry.waiter !== null || entry.info.lastSeen >= cutoff) continue;
+      this.dropSession(entry.info.session, `expired after ${this.sessionTtlMs / 1000}s without a pull`);
     }
   }
 
@@ -566,6 +658,12 @@ export class Hub implements Bridge {
   private noContent(): Response {
     return new Response(null, { status: 204, headers: { "x-ogsync-version": this.version } });
   }
+}
+
+/** NaN, negatives and 2^31+ all fire setTimeout immediately; clamp to a sane band. */
+function clampTimeout(requested: number | undefined): number {
+  if (requested === undefined || !Number.isFinite(requested)) return DEFAULT_CALL_TIMEOUT_MS;
+  return Math.min(MAX_CALL_TIMEOUT_MS, Math.max(MIN_CALL_TIMEOUT_MS, Math.floor(requested)));
 }
 
 function withPlayer(args: unknown, player: CallOpts["player"]): unknown {

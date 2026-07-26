@@ -11,6 +11,8 @@ import { Hub } from "./hub/hub.ts";
 import { createMcpServer } from "./mcp/server.ts";
 
 const PLACE = "Place2";
+/** Plugin endpoints require this header (browsers cannot set it). */
+const PLUGIN_HEADERS = { "x-ogsync-plugin": String(PROTO_VERSION) };
 
 class FakePlugin {
   cursor = 0;
@@ -30,6 +32,7 @@ class FakePlugin {
   async handshake(): Promise<Response> {
     return fetch(`${this.#base}/handshake`, {
       method: "POST",
+      headers: PLUGIN_HEADERS,
       body: JSON.stringify({
         proto: PROTO_VERSION,
         session: this.#session,
@@ -44,9 +47,9 @@ class FakePlugin {
   start(): void {
     this.#loop = (async () => {
       while (!this.#stopped) {
-        const res = await fetch(
-          `${this.#base}/pull?session=${this.#session}&cursor=${this.cursor}`,
-        ).catch(() => null);
+        const res = await fetch(`${this.#base}/pull?session=${this.#session}&cursor=${this.cursor}`, {
+          headers: PLUGIN_HEADERS,
+        }).catch(() => null);
         if (res === null || this.#stopped) return;
         if (res.status !== 200) continue;
         const body = (await res.json()) as { cursor: number; jobs: Job[] };
@@ -56,6 +59,7 @@ class FakePlugin {
         if (results.length > 0) {
           await fetch(`${this.#base}/push`, {
             method: "POST",
+            headers: PLUGIN_HEADERS,
             body: JSON.stringify({ session: this.#session, results }),
           });
         }
@@ -71,6 +75,7 @@ class FakePlugin {
   async pushEvent(ev: Record<string, unknown>): Promise<void> {
     await fetch(`${this.#base}/push`, {
       method: "POST",
+      headers: PLUGIN_HEADERS,
       body: JSON.stringify({ session: this.#session, events: [ev] }),
     });
   }
@@ -212,6 +217,7 @@ describe("daemon loop end to end", () => {
 
     const noAuth = await fetch(`http://127.0.0.1:${hub.port}/rpc`, {
       method: "POST",
+      headers: PLUGIN_HEADERS,
       body: JSON.stringify({ tool: "read", args: { path: "x" } }),
     });
     expect(noAuth.status).toBe(401);

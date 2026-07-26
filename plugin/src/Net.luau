@@ -85,6 +85,10 @@ end
 
 local function request(method: string, url: string, body: any?): (number, any, string?)
 	local options: {[string]: any} = { Url = url, Method = method }
+	-- The daemon rejects plugin endpoints without this header: a browser
+	-- cannot set it without a preflight the daemon never answers, which keeps
+	-- web pages from driving Studio over loopback.
+	local headers: {[string]: string} = { ["X-OGSync-Plugin"] = tostring(PROTO) }
 	if body ~= nil then
 		local okEncode, encoded = pcall(function(): string
 			return HttpService:JSONEncode(body)
@@ -93,8 +97,9 @@ local function request(method: string, url: string, body: any?): (number, any, s
 			return 0, nil, "serialization failed: " .. tostring(encoded)
 		end
 		options.Body = encoded
-		options.Headers = { ["Content-Type"] = "application/json" }
+		headers["Content-Type"] = "application/json"
 	end
+	options.Headers = headers
 	local okRequest, response = pcall(function(): any
 		return HttpService:RequestAsync(options)
 	end)
@@ -321,6 +326,9 @@ local function doHandshake(): boolean
 	state.accepted = true
 	state.connected = true
 	state.reason = nil
+	-- The daemon clears this session's queue and seq on every handshake, so the
+	-- cursor must restart with it or our acks would filter out real jobs.
+	cursor = 0
 	state.syncEnabled = response.syncEnabled == true
 	state.projectName = response.projectName
 	resetBackoff()

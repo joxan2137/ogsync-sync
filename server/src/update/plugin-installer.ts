@@ -2,7 +2,7 @@
 // Every failure path is non-fatal: the daemon still serves without a plugin
 // install (the user can drop OGSync.rbxm in by hand).
 
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { log } from "../log.ts";
@@ -49,7 +49,16 @@ export async function installPlugin(rbxmBytes: Uint8Array | null): Promise<Insta
       return { status: "current", file };
     }
     mkdirSync(dir, { recursive: true });
-    writeFileSync(file, rbxmBytes);
+    // Studio watches this directory; a torn read would load a broken plugin.
+    // Write beside the target, then rename atomically.
+    const tmp = `${file}.tmp-${process.pid}`;
+    writeFileSync(tmp, rbxmBytes);
+    try {
+      renameSync(tmp, file);
+    } catch (err) {
+      rmSync(tmp, { force: true });
+      throw err;
+    }
     log.info(`${existed ? "updated" : "installed"} Studio plugin at ${file}`);
     return { status: existed ? "updated" : "installed", file };
   } catch (err) {

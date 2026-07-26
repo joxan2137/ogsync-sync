@@ -44,16 +44,27 @@ async function handshake(overrides: Partial<HandshakeRequest> = {}): Promise<Han
     placeName: "Place2",
     ...overrides,
   };
-  const res = await fetch(`${base}/handshake`, { method: "POST", body: JSON.stringify(body) });
+  const res = await fetch(`${base}/handshake`, {
+    method: "POST",
+    headers: PLUGIN_HEADERS,
+    body: JSON.stringify(body),
+  });
   return (await res.json()) as HandshakeResponse;
 }
 
+/** Plugin endpoints require this; browsers cannot set it without a preflight. */
+const PLUGIN_HEADERS = { "x-ogsync-plugin": String(PROTO_VERSION) };
+
 async function pull(session = "s-edit", cursor = 0): Promise<Response> {
-  return fetch(`${base}/pull?session=${session}&cursor=${cursor}`);
+  return fetch(`${base}/pull?session=${session}&cursor=${cursor}`, { headers: PLUGIN_HEADERS });
 }
 
 async function push(body: Partial<PushRequest>): Promise<Response> {
-  return fetch(`${base}/push`, { method: "POST", body: JSON.stringify({ session: "s-edit", ...body }) });
+  return fetch(`${base}/push`, {
+    method: "POST",
+    headers: PLUGIN_HEADERS,
+    body: JSON.stringify({ session: "s-edit", ...body }),
+  });
 }
 
 async function jobsFrom(res: Response): Promise<PullResponse> {
@@ -261,13 +272,62 @@ test("unknown routes 404 and every JSON response carries serverVersion", async (
   expect(await res.json()).toMatchObject({ serverVersion: VERSION });
 });
 
-test("binding without target_place takes the first connected session", async () => {
+test("without target_place the first edit session wins and later ones are refused", async () => {
   hub.stop();
   hub = new Hub({ config: config({ target_place: null }), version: VERSION, port: 0, longPollMs: LONG_POLL_MS });
   hub.listen();
   base = `http://127.0.0.1:${hub.port}`;
   expect((await handshake({ session: "s-first", placeName: "Anything" })).accepted).toBe(true);
   expect(hub.bound()?.session).toBe("s-first");
+  // Silently binding a second place would let sync write to the wrong game.
+  const second = await handshake({ session: "s-second", placeName: "OtherPlace", placeId: 99 });
+  expect(second.accepted).toBe(false);
+  expect(second.reason).toMatch(/target_place/);
+  expect(hub.bound()?.session).toBe("s-first");
+});
+
+test("plugin endpoints refuse requests a web page could make", async () => {
+  await handshake();
+  const noHeader = await fetch(`${base}/pull?session=s-edit&cursor=0`);
+  expect(noHeader.status).toBe(403);
+  const withOrigin = await fetch(`${base}/pull?session=s-edit&cursor=0`, {
+    headers: { ...PLUGIN_HEADERS, origin: "https://evil.example" },
+  });
+  expect(withOrigin.status).toBe(403);
+  const fetchSite = await fetch(`${base}/push`, {
+    method: "POST",
+    headers: { ...PLUGIN_HEADERS, "sec-fetch-site": "cross-site" },
+    body: JSON.stringify({ session: "s-edit" }),
+  });
+  expect(fetchSite.status).toBe(403);
+  // /health stays open: second instances probe it to find a live daemon.
+  expect((await fetch(`${base}/health`, { headers: { origin: "https://evil.example" } })).status).toBe(200);
+});
+
+test("a session cannot answer another session's job", async () => {
+  await handshake();
+  await handshake({ session: "s-play", role: "server" });
+  const call = hub.call("sel.get", {}, { timeoutMs: 2000 });
+  const [job] = (await jobsFrom(await pull())).jobs;
+  expect(job).toBeDefined();
+  const stolen = await fetch(`${base}/push`, {
+    method: "POST",
+    headers: PLUGIN_HEADERS,
+    body: JSON.stringify({ session: "s-play", results: [{ id: job!.id, ok: true, data: ["forged"] }] }),
+  });
+  expect(stolen.status).toBe(200);
+  await push({ results: [{ id: job!.id, ok: true, data: ["real"] }] });
+  expect(await call).toEqual(["real"]);
+});
+
+test("a cursor past our seq is ignored instead of eating the queue", async () => {
+  await handshake();
+  const call = hub.call("sel.get", {}, { timeoutMs: 2000 });
+  const res = await pull("s-edit", 9999);
+  const { jobs } = await jobsFrom(res);
+  expect(jobs).toHaveLength(1);
+  await push({ results: [{ id: jobs[0]!.id, ok: true, data: [] }] });
+  await call;
 });
 
 test("a non-loopback bind is refused outright", () => {

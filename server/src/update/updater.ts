@@ -6,7 +6,7 @@
 // "inconclusive", never as "no update"; nothing is ever written when the
 // executable's directory is read-only; the check never blocks serve startup.
 
-import { accessSync, chmodSync, constants, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { accessSync, chmodSync, constants, existsSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import type { OgsyncConfig } from "../proto/types.ts";
@@ -21,7 +21,13 @@ const CHECKSUMS_ASSET = "checksums.txt";
 const STATE_FILE = "update.json";
 const CHECK_THROTTLE_MS = 60 * 60 * 1000;
 const HTTP_TIMEOUT_MS = 10_000;
+const DOWNLOAD_TIMEOUT_MS = 120_000;
 export const PERIODIC_CHECK_MS = 6 * 60 * 60 * 1000;
+
+/** Set once a swap lands: the new image only takes effect on restart. */
+let installedPendingRestart: string | null = null;
+/** Guards against the 6 h timer starting a second concurrent swap. */
+let installInFlight = false;
 
 interface UpdateState {
   lastChecked?: number;
@@ -69,6 +75,11 @@ export async function checkForUpdate(opts: UpdateCheckOptions = {}): Promise<Upd
   if (!force && elapsed < CHECK_THROTTLE_MS) {
     return { status: "throttled", nextCheckIn: CHECK_THROTTLE_MS - elapsed };
   }
+
+  if (installedPendingRestart !== null) {
+    return { status: "available", version: installedPendingRestart, reason: "installed; restart ogsync to run it" };
+  }
+  if (installInFlight) return { status: "inconclusive", reason: "an install is already running" };
 
   const fetched = await fetchLatestRelease(state.etag, force);
   if (fetched.kind === "inconclusive") return { status: "inconclusive", reason: fetched.reason };
@@ -216,6 +227,21 @@ async function installRelease(release: Release, version: string, state: UpdateSt
   if (!isWritable(exeDir)) {
     return notInstalled(version, state, `${exeDir} is not writable — reinstall via your package manager to update`);
   }
+  installInFlight = true;
+  try {
+    return await performInstall(release, version, state, assetName, exe);
+  } finally {
+    installInFlight = false;
+  }
+}
+
+async function performInstall(
+  release: Release,
+  version: string,
+  state: UpdateState,
+  assetName: string,
+  exe: string,
+): Promise<UpdateOutcome> {
 
   const asset = release.assets.find((candidate) => candidate.name === assetName);
   if (!asset) return notInstalled(version, state, `release ${version} has no ${assetName}`);
@@ -240,17 +266,34 @@ async function installRelease(release: Release, version: string, state: UpdateSt
 
     swapBinary(exe, readFileSync(binary));
     writeState({ lastChecked: Date.now(), etag: release.etag ?? state.etag });
+    // The new image only runs after a restart; further checks this process
+    // would re-download and re-swap the same release.
+    installedPendingRestart = version;
     return { status: "updated", version };
   } catch (err) {
-    return notInstalled(version, state, message(err));
+    // Only integrity failures earn a permanent skip; transient IO and network
+    // faults must be retried on the next window.
+    return notInstalled(version, state, message(err), false);
   } finally {
     rmSync(staging, { recursive: true, force: true });
   }
 }
 
-/** Remembers the version so a broken release is not re-downloaded every 6 h. */
-function notInstalled(version: string, state: UpdateState, reason: string): UpdateOutcome {
-  writeState({ ...state, lastChecked: Date.now(), skippedVersion: version });
+/**
+ * `permanent` marks a release as broken (bad checksum, missing asset) so it is
+ * not re-downloaded every 6 h. Transient failures leave it eligible.
+ */
+function notInstalled(
+  version: string,
+  state: UpdateState,
+  reason: string,
+  permanent = true,
+): UpdateOutcome {
+  writeState({
+    ...state,
+    lastChecked: Date.now(),
+    ...(permanent ? { skippedVersion: version } : {}),
+  });
   return { status: "available", version, reason };
 }
 
@@ -258,6 +301,8 @@ async function download(url: string): Promise<Buffer> {
   const res = await fetch(url, {
     headers: { "user-agent": `ogsync/${VERSION}`, accept: "application/octet-stream" },
     redirect: "follow",
+    // A hung CDN read must not stall the daemon indefinitely.
+    signal: AbortSignal.timeout(DOWNLOAD_TIMEOUT_MS),
   });
   if (!res.ok) throw new Error(`download failed: HTTP ${res.status} for ${url}`);
   return Buffer.from(await res.arrayBuffer());
@@ -305,13 +350,23 @@ function findBinary(dir: string, assetName: string): string | null {
 
 function swapBinary(exe: string, bytes: Buffer): void {
   if (process.platform === "win32") {
+    // Stage the new image first so the window with no executable at `exe` is a
+    // single rename wide, and a locked leftover `.old` cannot strand us.
+    const staged = `${exe}.new`;
     const backup = `${exe}.old`;
-    rmSync(backup, { force: true });
-    renameSync(exe, backup); // Windows allows renaming a running image, not overwriting it
+    writeFileSync(staged, bytes);
     try {
-      writeFileSync(exe, bytes);
+      rmSync(backup, { force: true });
+    } catch {
+      // A previous .old still running as an image; park this one beside it.
+    }
+    const parked = existsSync(backup) ? `${exe}.old-${Date.now().toString(36)}` : backup;
+    renameSync(exe, parked); // Windows allows renaming a running image, not overwriting it
+    try {
+      renameSync(staged, exe);
     } catch (err) {
-      renameSync(backup, exe);
+      renameSync(parked, exe);
+      rmSync(staged, { force: true });
       throw err;
     }
     return;
