@@ -61,7 +61,7 @@ export function loadConfig(dir: string): OgsyncConfig {
 
 export function defaultConfigToml(projectName: string): string {
   const d = CONFIG_DEFAULTS;
-  return `# OGSync project config. Docs: https://github.com/joxan2137/ogsync
+  return `# OGSync project config. Docs: https://github.com/joxan2137/ogsync-sync
 
 [project]
 name = "${projectName}"

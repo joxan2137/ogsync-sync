@@ -14,7 +14,7 @@ import { ogsyncHome } from "../config.ts";
 import { log } from "../log.ts";
 import { VERSION } from "../version.ts";
 
-export const REPO = "joxan2137/ogsync";
+export const REPO = "joxan2137/ogsync-sync";
 
 const LATEST_RELEASE_URL = `https://api.github.com/repos/${REPO}/releases/latest`;
 const CHECKSUMS_ASSET = "checksums.txt";
