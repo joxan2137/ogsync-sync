@@ -59,6 +59,20 @@ local state: Status = {
 	projectName = nil,
 }
 
+-- UI.setState, injected by init so the transport never requires the UI layer.
+local observer: ((partial: {[string]: any}) -> ())? = nil
+
+function Net.setObserver(fn: ((partial: {[string]: any}) -> ())?)
+	observer = fn
+end
+
+local function notify(partial: {[string]: any})
+	local fn = observer
+	if fn ~= nil then
+		pcall(fn, partial)
+	end
+end
+
 local function resetBackoff()
 	backoff = BACKOFF_MIN
 end
@@ -254,12 +268,15 @@ local function doHandshake(): boolean
 	if err ~= nil or status == 0 then
 		state.connected = false
 		state.reason = err
-		task.wait(nextBackoff())
+		local retry = nextBackoff()
+		notify({ status = "connecting", reason = state.reason, retryIn = retry })
+		task.wait(retry)
 		return true
 	end
 	if status ~= 200 or type(body) ~= "table" then
 		state.connected = false
 		state.reason = string.format("handshake %d", status)
+		notify({ status = "connecting", reason = state.reason, retryIn = HANDSHAKE_RETRY })
 		task.wait(HANDSHAKE_RETRY)
 		return true
 	end
@@ -274,6 +291,13 @@ local function doHandshake(): boolean
 		state.reason = "protocol mismatch"
 		state.connected = false
 		running = false
+		notify({
+			status = "update",
+			reason = string.format("daemon speaks proto %s, plugin speaks %d", tostring(response.proto), PROTO),
+			serverVersion = response.serverVersion,
+			updatePlugin = true,
+			connected = false,
+		})
 		return false
 	end
 
@@ -283,6 +307,12 @@ local function doHandshake(): boolean
 		state.accepted = false
 		state.connected = true
 		state.reason = if type(response.reason) == "string" then response.reason else "not accepted"
+		notify({
+			status = "rejected",
+			reason = state.reason,
+			serverVersion = state.serverVersion,
+			retryIn = HANDSHAKE_RETRY,
+		})
 		task.wait(HANDSHAKE_RETRY)
 		return true
 	end
@@ -297,6 +327,17 @@ local function doHandshake(): boolean
 	if response.updatePlugin == true then
 		warn("[OGSync] daemon has a newer plugin build — reload plugins in Studio")
 	end
+	-- "" rather than nil: absent keys are skipped by the merge, so clearing a
+	-- stale reason needs a present-but-empty value.
+	notify({
+		status = "connected",
+		reason = "",
+		serverVersion = state.serverVersion,
+		projectName = state.projectName,
+		syncEnabled = state.syncEnabled,
+		updatePlugin = response.updatePlugin == true,
+		connected = true,
+	})
 	return true
 end
 
@@ -309,11 +350,16 @@ local function pullOnce()
 	if err ~= nil or status == 0 then
 		state.connected = false
 		state.reason = err
-		task.wait(nextBackoff())
+		local retry = nextBackoff()
+		notify({ status = "connecting", reason = state.reason, retryIn = retry })
+		task.wait(retry)
 		return
 	end
 
 	if status == 204 then
+		if not state.connected then
+			notify({ status = "connected", reason = "", connected = true })
+		end
 		state.connected = true
 		state.reason = nil
 		resetBackoff()
@@ -321,6 +367,9 @@ local function pullOnce()
 	end
 
 	if status == 200 then
+		if not state.connected then
+			notify({ status = "connected", reason = "", connected = true })
+		end
 		state.connected = true
 		state.reason = nil
 		resetBackoff()
@@ -343,13 +392,16 @@ local function pullOnce()
 		accepted = false
 		state.accepted = false
 		state.reason = if type(body) == "table" then tostring((body :: any).error) else string.format("pull %d", status)
+		notify({ status = "connecting", reason = state.reason, retryIn = REJECT_RETRY })
 		task.wait(REJECT_RETRY)
 		return
 	end
 
 	state.connected = false
 	state.reason = string.format("pull %d", status)
-	task.wait(nextBackoff())
+	local retry = nextBackoff()
+	notify({ status = "connecting", reason = state.reason, retryIn = retry })
+	task.wait(retry)
 end
 
 -- ------------------------------------------------------------------ lifecycle
@@ -370,6 +422,7 @@ function Net.start(config: Config)
 	state.accepted = false
 	state.connected = false
 	state.reason = nil
+	notify({ status = "connecting", reason = "", connected = true, retryIn = HANDSHAKE_RETRY })
 
 	generation += 1
 	local gen = generation
@@ -401,6 +454,7 @@ function Net.stop()
 	state.connected = false
 	state.accepted = false
 	state.reason = "stopped"
+	notify({ status = "disconnected", reason = "", connected = false, syncEnabled = false })
 end
 
 function Net.isRunning(): boolean

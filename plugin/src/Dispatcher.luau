@@ -5,6 +5,7 @@
 
 local Applier = require(script.Parent.Sync.Applier)
 local Output = require(script.Parent.Util.Output)
+local Panel = require(script.Parent.UI.Panel)
 local Path = require(script.Parent.Util.Path)
 
 local OPS_MODULES = {
@@ -45,6 +46,16 @@ end
 
 local function registerCoreOps(ctx: Context)
 	Applier.install(Dispatcher.register)
+
+	-- Informational: the daemon pushes the current conflict list for the panel.
+	Dispatcher.register("sync.conflicts", function(args: any): any
+		local list = if type(args) == "table" then (args :: any).list else nil
+		if type(list) ~= "table" then
+			error("sync.conflicts needs list", 0)
+		end
+		Panel.setState({ conflicts = list })
+		return { ok = true }
+	end)
 
 	Dispatcher.register("sel.get", function(): {string}
 		local selection = game:GetService("Selection")

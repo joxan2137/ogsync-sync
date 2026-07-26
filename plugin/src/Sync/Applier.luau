@@ -24,8 +24,18 @@ local rootPaths: {string} = {}
 local rootInstances: {Instance} = {}
 local lastApplied: {[string]: string} = {}
 local lastStructural: {[string]: number} = {}
+local pending = 0
 
 Applier.onRootsChanged = nil :: ((roots: {Instance}) -> ())?
+-- UI.setState, injected by init: reports how many changes are still queued here.
+Applier.onSyncState = nil :: ((partial: {[string]: any}) -> ())?
+
+local function reportPending()
+	local listener = Applier.onSyncState
+	if listener ~= nil then
+		pcall(listener, { pending = pending })
+	end
+end
 
 -- An open document holds edits that have not reached .Source yet; Watcher and
 -- Applier must read the same text or their hashes disagree.
@@ -302,10 +312,18 @@ function Applier.apply(args: any): {any}
 	if type(args) ~= "table" or type(args.changes) ~= "table" then
 		error("sync.apply needs changes", 0)
 	end
+	local changes = args.changes :: {any}
 	local results: {any} = {}
-	for index, change in args.changes :: {any} do
+	pending += #changes
+	reportPending()
+	for index, change in changes do
 		results[index] = applyChange(change)
+		pending -= 1
+		if pending % 10 == 0 then
+			reportPending()
+		end
 	end
+	reportPending()
 	return results
 end
 

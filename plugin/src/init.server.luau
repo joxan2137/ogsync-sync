@@ -10,6 +10,7 @@ local Applier = require(script.Sync.Applier)
 local Broker = require(script.Broker)
 local Dispatcher = require(script.Dispatcher)
 local Net = require(script.Net)
+local Panel = require(script.UI.Panel)
 local Version = require(script.Version)
 local Watcher = require(script.Sync.Watcher)
 
@@ -104,27 +105,58 @@ else
 	local toolbar = plugin:CreateToolbar("OGSync")
 	local button = toolbar:CreateButton(
 		"OGSyncToggle",
-		string.format("OGSync %s — toggle sync with the daemon on 127.0.0.1:%d", Version, port),
+		string.format("OGSync %s — show the connection panel", Version),
 		"",
 		"OGSync"
 	)
 	button.ClickableWhenViewportHidden = true
-	button:SetActive(enabled)
-	button.Click:Connect(function()
-		enabled = not enabled
-		plugin:SetSetting(SETTING_ENABLED, enabled)
-		button:SetActive(enabled)
-		if enabled then
+
+	local function setConnected(on: boolean)
+		enabled = on
+		plugin:SetSetting(SETTING_ENABLED, on)
+		Panel.setState({ connected = on })
+		if on then
 			startSync()
 		else
 			stopSync()
 		end
-	end)
+	end
+
+	local function setPort(newPort: number)
+		plugin:SetSetting(SETTING_PORT, newPort)
+		config.baseUrl = string.format("http://127.0.0.1:%d", newPort)
+		Panel.setState({ port = newPort })
+		if Net.isRunning() then
+			stopSync()
+			startSync()
+		end
+	end
+
+	Panel.start({
+		plugin = plugin,
+		version = Version,
+		port = port,
+		connected = enabled,
+		pushEvent = Net.pushEvent,
+		setConnected = setConnected,
+		setPort = setPort,
+		onVisibility = function(visible: boolean)
+			button:SetActive(visible)
+		end,
+	})
+	Net.setObserver(Panel.setState)
+	Applier.onSyncState = Panel.setState
+	button.Click:Connect(Panel.toggle)
 
 	if enabled then
 		startSync()
 	end
 	table.insert(cleanups, stopSync)
+	table.insert(cleanups, Panel.stop)
+	table.insert(cleanups, function()
+		Net.setObserver(nil)
+		Applier.onSyncState = nil
+	end)
 end
 
 plugin.Unloading:Connect(function()
