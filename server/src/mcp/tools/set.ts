@@ -31,9 +31,25 @@ export const tool = defineTool({
     for (const t of args.targets) {
       if (!t.path && !t.paths?.length) throw badArg("each target needs path or paths");
     }
+    // JSON null object values vanish in the plugin's JSONDecode, so null
+    // attr deletions travel as the plugin's attrs_remove list instead.
+    const targets = args.targets.map((t) => {
+      if (!t.attrs) return t;
+      const attrs: Record<string, unknown> = {};
+      const attrsRemove: string[] = [];
+      for (const [k, v] of Object.entries(t.attrs)) {
+        if (v === null) attrsRemove.push(k);
+        else attrs[k] = v;
+      }
+      return {
+        ...t,
+        attrs: Object.keys(attrs).length ? attrs : undefined,
+        attrs_remove: attrsRemove.length ? attrsRemove : undefined,
+      };
+    });
     const data = (await bridge.call(
       "inst.set",
-      { targets: args.targets },
+      { targets },
       callOpts(args),
     )) as SetResult;
 

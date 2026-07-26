@@ -569,6 +569,17 @@ export class SyncEngine implements SyncControl {
     this.#checkBind();
     const bound = this.#bridge.bound();
     if (bound === null || bound.session !== from.session) return;
+    if (ev.ev === "syncToggle") {
+      if (ev.paused) this.pause();
+      else this.resume();
+      return;
+    }
+    if (ev.ev === "resolveConflict") {
+      void this.resolve(ev.file, ev.keep).catch((e) =>
+        this.#log.warn(`sync: panel resolve ${ev.file} failed: ${e instanceof Error ? e.message : e}`),
+      );
+      return;
+    }
     const path = studioEventPath(ev);
     if (path === null || this.#project === null) return;
     const roots = this.#project.syncRoots();
@@ -1031,11 +1042,23 @@ export class SyncEngine implements SyncControl {
     this.#conflicts.set(file, info);
     const where = backupFile === undefined ? "" : ` (backup ${backupFile})`;
     this.#log.warn(`sync: conflict ${file} ⇄ ${path} → ${resolution}${where}`);
+    this.#pushConflicts();
   }
 
   #clearConflict(file: string, ts: number, resolution: ConflictInfo["resolution"]): void {
     this.#conflicts.delete(file);
     this.#log.info(`sync: ${file} resolved ${resolution} at ${ts}`);
+    this.#pushConflicts();
+  }
+
+  /** Keeps the plugin connection panel's conflict list current. Fire-and-forget. */
+  #pushConflicts(): void {
+    const list = [...this.#conflicts.values()]
+      .filter((c) => c.resolution === "pending")
+      .map((c) => ({ file: c.file, path: c.path, ts: c.ts }));
+    void this.#bridge
+      .call("sync.conflicts", { list }, { timeoutMs: 5000 })
+      .catch(() => undefined);
   }
 
   // ---------------------------------------------------------------- plumbing
