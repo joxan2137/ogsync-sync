@@ -48,6 +48,8 @@ Events (plugin → daemon, fire-and-forget):
 - `{ev: "log", ctx: "edit"|"server"|"client", level, msg, ts}`
 - `{ev: "playtestState", state: "starting"|"running"|"stopped", mode?}`
 - `{ev: "selection", paths}`
+- `{ev: "syncToggle", paused}` — user hit Pause/Resume in the plugin panel
+- `{ev: "resolveConflict", file, keep: "fs"|"studio"}` — panel conflict button
 
 ### GET /health
 `{service: "ogsync", version, proto: 1, sessions: [{session, role, placeName,
@@ -93,6 +95,8 @@ daemon renders `…more` cursors.
 - `sync.snapshot {roots: [path]}` → full script/container listing under roots:
   `[{path, class, hash, runCtx}]` (no sources). Daemon diffs against FS+shadow.
 - `sync.hash {paths}` → `[{path, hash}]`.
+- `sync.conflicts {list: [{file, path, ts}]}` → `{ok: true}` — informational,
+  daemon pushes current conflict list for the plugin panel to render.
 - `sync.apply {changes: [{kind: "write", path, class, source, baseHash?} |
   {kind: "create", path, class, source?} | {kind: "delete", path} |
   {kind: "rename", path, newName}]}` → per-change `{ok, conflictHash?}`.

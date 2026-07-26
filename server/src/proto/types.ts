@@ -73,7 +73,10 @@ export type BridgeEvent =
   | { ev: "instRenamed"; path: string; oldPath: string }
   | { ev: "log"; ctx: Role; level: "info" | "warn" | "error"; msg: string; ts: number }
   | { ev: "playtestState"; state: "starting" | "running" | "stopped"; mode?: string }
-  | { ev: "selection"; paths: string[] };
+  | { ev: "selection"; paths: string[] }
+  // Connection-panel UI (docs/PLUGIN_CONTRACT.md § Connection panel)
+  | { ev: "syncToggle"; paused: boolean }
+  | { ev: "resolveConflict"; file: string; keep: "fs" | "studio" };
 
 // ---------------------------------------------------------------- ops
 
@@ -91,7 +94,7 @@ export const OP_NAMES = [
   "rbxm.export", "rbxm.import",
   "hist.op",
   "sel.get",
-  "sync.apply", "sync.snapshot", "sync.hash",
+  "sync.apply", "sync.snapshot", "sync.hash", "sync.conflicts",
 ] as const;
 export type OpName = (typeof OP_NAMES)[number];
 

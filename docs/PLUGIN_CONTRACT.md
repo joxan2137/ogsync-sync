@@ -112,7 +112,36 @@ Net.pushPartial(jobId: string, data: any)
 - **No busy loops**: all polling via `task.wait`, heartbeat-driven; Net pull
   loop reconnects with backoff 1 s ×1.5 → max 10 s on transport errors,
   immediately on 204.
-- **UI**: one toolbar button "OGSync" toggling enabled (persisted
-  `plugin:SetSetting("ogsync_enabled")`), tooltip shows daemon
-  connection state + sync status. Optional tiny DockWidget status panel —
-  keep minimal, no fancy UI v1.
+- **UI**: toolbar button "OGSync" toggles the connection panel (DockWidget).
+
+## Connection panel (plugin/src/UI/Panel.luau + UI/Theme.luau)
+
+DockWidgetPluginGui (`plugin:CreateDockWidgetPluginGui`, default float
+320×260, InitialDockState Right allowed). Edit role only (play roles: no UI).
+Studio-theme aware: colors from `settings().Studio.Theme:GetColor(...)`,
+re-applied on `ThemeChanged`. Plain Frames/TextLabels/TextButtons — no
+external UI libs.
+
+Sections top→bottom:
+1. **Status header** — dot + text: `Connected` (green, shows daemon version +
+   project name) / `Connecting…` (amber, retry countdown) / `Disconnected`
+   (grey) / `Rejected` (red, shows handshake `reason` verbatim, e.g. bound to
+   another place) / `Update required` (red, when proto mismatch or
+   `updatePlugin`).
+2. **Connect controls** — Connect/Disconnect button (drives Net start/stop +
+   persists `ogsync_enabled`); port TextBox (persists `ogsync_port`, default
+   3667, reconnects on commit).
+3. **Sync row** — `Sync: on (N pending)` / `paused` / `off`; Pause/Resume
+   button (sends event `{ev:"syncToggle", paused}` — daemon honors via
+   SyncControl).
+4. **Conflicts list** — scrolling, one row per conflict pushed by daemon job
+   `sync.conflicts` (daemon → plugin informational job; args
+   `{list: [{file, path, ts}]}`, plugin acks `{ok:true}` and renders); each
+   row: shortened path + two buttons `Keep FS` / `Keep Studio` → event
+   `{ev:"resolveConflict", file, keep}`.
+5. **Footer** — plugin version; when `updatePlugin` true show
+   "Daemon has newer plugin — reload plugins" hint.
+
+State flows through a tiny observer: `UI.setState(partial)` merges + re-renders
+affected rows only. Net calls `UI.setState` on connect/disconnect/handshake;
+Applier on sync counts. Panel never blocks Net (all UI updates task.defer).
