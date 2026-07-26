@@ -1,0 +1,13 @@
+node_modules/
+dist/
+build/
+*.rbxm
+!assets/*.rbxm
+*.rbxl
+*.rbxlx.lock
+*.log
+.DS_Store
+sourcemap.json
+/plugin/Packages/
+.ogsync/
+coverage/
