@@ -57,14 +57,8 @@ local function registerCoreOps(ctx: Context)
 		return { ok = true }
 	end)
 
-	Dispatcher.register("sel.get", function(): {string}
-		local selection = game:GetService("Selection")
-		local paths: {string} = {}
-		for index, inst in selection:Get() do
-			paths[index] = Path.of(inst)
-		end
-		return paths
-	end)
+	-- sel.get is registered by Ops/Sel.luau ({paths, truncated, total}); no
+	-- core fallback so exactly one result shape exists on the wire.
 
 	Dispatcher.register("play.stopSignal", function(): any
 		if ctx.role ~= "edit" then

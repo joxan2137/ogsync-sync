@@ -185,7 +185,13 @@ local function applyCreate(change: {[string]: any}): {[string]: any}
 	end
 	local existing = parent:FindFirstChild(name)
 	if existing then
-		return applyChange({ kind = "write", path = path, source = change.source, class = change.class })
+		return applyChange({
+			kind = "write",
+			path = path,
+			source = change.source,
+			class = change.class,
+			baseHash = change.baseHash,
+		})
 	end
 	local className = if type(change.class) == "string" then change.class else "ModuleScript"
 	local okNew, created = pcall(function(): Instance

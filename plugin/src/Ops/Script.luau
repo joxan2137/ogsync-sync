@@ -399,6 +399,7 @@ return function(register: Register)
 		local source = if created then "" else readSource(target)
 		local newSource: string
 		local center = 1
+		local replacedCount: number? = nil
 
 		if type(args.old) == "string" then
 			if type(args.new) ~= "string" then
@@ -422,6 +423,7 @@ return function(register: Register)
 			if count == 0 then
 				error("`old` text not found in " .. Path.of(target))
 			end
+			replacedCount = count
 			center = lineOfOffset(source, first)
 		elseif type(args.lines) == "table" then
 			if type(args.new) ~= "string" then
@@ -480,6 +482,7 @@ return function(register: Register)
 			created = created,
 			total = #newLines,
 			hash = Hash.content(newSource),
+			replaced = replacedCount,
 			context = contextAround(newLines, center),
 		}
 	end)

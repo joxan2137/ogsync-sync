@@ -2,13 +2,18 @@ import { z } from "zod";
 import { capText, instBlock, lines, moreLine } from "../fmt.ts";
 import { callOpts, defineTool, TIMEOUT_ARG } from "../tool.ts";
 
+interface RefEntry {
+  prop: string;
+  path: string;
+}
+
 interface InstanceInfo {
   path: string;
   class?: string;
   props?: Record<string, unknown>;
   attrs?: Record<string, unknown>;
   tags?: string[];
-  refs?: { incoming?: string[]; outgoing?: string[]; truncated?: boolean };
+  refs?: { incoming?: RefEntry[]; outgoing?: RefEntry[]; truncated?: boolean };
   place?: Record<string, unknown>;
 }
 
@@ -44,8 +49,9 @@ export const tool = defineTool({
       for (const [k, v] of Object.entries(inst.place ?? {})) entries[k] = v;
       for (const [k, v] of Object.entries(inst.attrs ?? {})) entries[`@${k}`] = v;
       if (inst.tags?.length) entries["#tags"] = inst.tags.join(",");
-      if (inst.refs?.outgoing?.length) entries["refs.out"] = inst.refs.outgoing.join(",");
-      if (inst.refs?.incoming?.length) entries["refs.in"] = inst.refs.incoming.join(",");
+      const ref = (r: RefEntry) => `${r.prop}→${r.path}`;
+      if (inst.refs?.outgoing?.length) entries["refs.out"] = inst.refs.outgoing.map(ref).join(", ");
+      if (inst.refs?.incoming?.length) entries["refs.in"] = inst.refs.incoming.map(ref).join(", ");
       out.push(...instBlock(inst.path, inst.class, entries));
     }
     for (const e of data.errors ?? []) out.push(`ERR ${e.path}: ${e.err}`);

@@ -63,7 +63,8 @@ local function sendClick(vim: any, action: any)
 	if not x or not y then
 		error("click action needs x and y")
 	end
-	local button = tonumber(action.button) or 0
+	local BUTTONS = { left = 0, right = 1, middle = 2 }
+	local button = BUTTONS[tostring(action.button)] or tonumber(action.button) or 0
 	vim:SendMouseButtonEvent(x, y, button, true, game, 0)
 	task.wait(0.03)
 	vim:SendMouseButtonEvent(x, y, button, false, game, 0)

@@ -1142,7 +1142,11 @@ export class SyncEngine implements SyncControl {
 
   async #fetchSource(path: string): Promise<string | null> {
     try {
-      const source = pickSource(await this.#bridge.call("script.read", { path }));
+      // limit must cover any script; the plugin default of 200 lines would
+      // silently truncate what we write to disk.
+      const source = pickSource(
+        await this.#bridge.call("script.read", { path, limit: 1_000_000 }),
+      );
       if (source === null) this.#log.warn(`sync: script.read returned no source for ${path}`);
       return source;
     } catch (e) {

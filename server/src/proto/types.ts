@@ -221,6 +221,15 @@ export interface SnapshotEntry {
 }
 
 /**
+ * Script sources are hashed and shipped LF-only. Studio never produces \r;
+ * Windows editors do — normalize at every file-read boundary so both sides
+ * hash identical bytes.
+ */
+export function normalizeSource(s: string): string {
+  return s.includes("\r") ? s.replaceAll("\r\n", "\n") : s;
+}
+
+/**
  * Dual FNV-1a 32-bit over UTF-8 bytes, hex-concatenated (16 chars).
  * The plugin implements the identical algorithm in Luau over raw string
  * bytes (Luau strings are byte arrays; sources are UTF-8) — both sides must
