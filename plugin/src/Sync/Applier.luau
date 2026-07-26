@@ -16,14 +16,23 @@ do
 	end
 end
 
-local STRUCTURAL_WINDOW = 2
+-- Structural echoes only cover the round trip of one apply; anything later is a
+-- real user action on that path and must reach the daemon.
+local STRUCTURAL_WINDOW = 0.6
+local ECHO_TTL = 60
+local ECHO_LIMIT = 512
 
 local Applier = {}
 
+export type StructuralKind = "create" | "delete" | "rename"
+
+type EchoRecord = { at: number, hash: string? }
+
 local rootPaths: {string} = {}
 local rootInstances: {Instance} = {}
-local lastApplied: {[string]: string} = {}
-local lastStructural: {[string]: number} = {}
+-- lastApplied is keyed by path, lastStructural by `kind .. "|" .. path`.
+local lastApplied: {[string]: EchoRecord} = {}
+local lastStructural: {[string]: EchoRecord} = {}
 local pending = 0
 
 Applier.onRootsChanged = nil :: ((roots: {Instance}) -> ())?
@@ -35,6 +44,16 @@ local function reportPending()
 	if listener ~= nil then
 		pcall(listener, { pending = pending })
 	end
+end
+
+-- Everything that crosses the bridge (sources and the hashes over them) is
+-- LF-only, matching normalizeSource() in server/src/proto/types.ts. Studio keeps
+-- whatever line endings it has; only the wire form is normalized.
+local function toLf(source: string): string
+	if string.find(source, "\r", 1, true) == nil then
+		return source
+	end
+	return (string.gsub(source, "\r\n", "\n"))
 end
 
 -- An open document holds edits that have not reached .Source yet; Watcher and
@@ -50,14 +69,14 @@ local function sourceOf(inst: Instance): string
 				return (document :: ScriptDocument):GetText()
 			end)
 			if okText and type(text) == "string" then
-				return text
+				return toLf(text)
 			end
 		end
 	end
 	local ok, source = pcall(function(): string
 		return (inst :: any).Source
 	end)
-	return if ok and type(source) == "string" then source else ""
+	return if ok and type(source) == "string" then toLf(source) else ""
 end
 
 local function hashOf(inst: Instance): string
@@ -84,37 +103,85 @@ local function runContextOf(inst: Instance): string?
 	return nil
 end
 
+-- Echo records outlive the apply that wrote them, so a session that writes many
+-- one-off paths would leak: expired records go, and the oldest survivor makes
+-- room for the incoming one once the map is full.
+local function evict(records: {[string]: EchoRecord})
+	local now = os.clock()
+	local count = 0
+	local oldestKey: string? = nil
+	local oldestAt = math.huge
+	for key, record in records do
+		if now - record.at > ECHO_TTL then
+			records[key] = nil
+		else
+			count += 1
+			if record.at < oldestAt then
+				oldestAt = record.at
+				oldestKey = key
+			end
+		end
+	end
+	if count >= ECHO_LIMIT and oldestKey ~= nil then
+		records[oldestKey] = nil
+	end
+end
+
 -- Daemon paths and Path.of output can differ in bracket form for the same
--- instance; record both so Watcher's echo check always hits.
-local function markStructural(path: string, inst: Instance?)
-	lastStructural[path] = os.clock()
+-- instance; record both so Watcher's echo check always hits. The kind is part of
+-- the key: the create we just applied must not swallow a user's delete of it.
+local function markStructural(kind: StructuralKind, path: string, inst: Instance?)
+	evict(lastStructural)
+	local at = os.clock()
+	lastStructural[kind .. "|" .. path] = { at = at }
 	if inst ~= nil then
 		local canonical = Path.of(inst)
 		if canonical ~= path then
-			lastStructural[canonical] = os.clock()
+			lastStructural[kind .. "|" .. canonical] = { at = at }
 		end
 	end
 end
 
 local function markApplied(path: string, hash: string, inst: Instance?)
-	lastApplied[path] = hash
+	evict(lastApplied)
+	local at = os.clock()
+	lastApplied[path] = { at = at, hash = hash }
 	if inst ~= nil then
 		local canonical = Path.of(inst)
 		if canonical ~= path then
-			lastApplied[canonical] = hash
+			lastApplied[canonical] = { at = at, hash = hash }
 		end
 	end
 end
 
-function Applier.setRoots(paths: {string})
-	rootPaths = table.clone(paths)
-	rootInstances = {}
+local function resolveRoots(paths: {string}): {Instance}
+	local instances: {Instance} = {}
 	for _, path in paths do
 		local inst = Path.resolve(path)
 		if inst then
-			table.insert(rootInstances, inst)
+			table.insert(instances, inst)
 		end
 	end
+	return instances
+end
+
+-- Instances are compared too: a root replaced in Studio carries dead Watcher
+-- connections even though its path never changed.
+local function rootsUnchanged(paths: {string}, instances: {Instance}): boolean
+	if #paths ~= #rootPaths or #instances ~= #rootInstances then
+		return false
+	end
+	for index, path in paths do
+		if rootPaths[index] ~= path or rootInstances[index] ~= instances[index] then
+			return false
+		end
+	end
+	return true
+end
+
+function Applier.setRoots(paths: {string})
+	rootPaths = table.clone(paths)
+	rootInstances = resolveRoots(rootPaths)
 	local listener = Applier.onRootsChanged
 	if listener then
 		listener(rootInstances)
@@ -132,18 +199,32 @@ function Applier.rootPaths(): {string}
 	return rootPaths
 end
 
--- hash omitted (nil) asks about a structural change: creates/deletes/renames we
--- just applied would otherwise bounce straight back as Watcher events.
-function Applier.wasEcho(path: string, hash: string?): boolean
-	if hash ~= nil then
-		if lastApplied[path] == hash then
-			lastApplied[path] = nil
-			return true
-		end
+-- The record survives repeated hits: the Source signal and
+-- TextDocumentDidChange can report the same applied content in two different
+-- debounce windows, and only the second one would look like a user edit. It is
+-- dropped as soon as a different hash proves the path really changed.
+function Applier.wasEcho(path: string, hash: string): boolean
+	local record = lastApplied[path]
+	if record == nil then
 		return false
 	end
-	local at = lastStructural[path]
-	return at ~= nil and (os.clock() - at) < STRUCTURAL_WINDOW
+	if os.clock() - record.at > ECHO_TTL then
+		lastApplied[path] = nil
+		return false
+	end
+	if record.hash == hash then
+		return true
+	end
+	lastApplied[path] = nil
+	return false
+end
+
+-- Structural echo: the create/delete/rename we just applied bounces back as a
+-- Watcher event. Matched on kind as well as path, and over a window short enough
+-- that a user acting on the same path is never mistaken for the echo.
+function Applier.wasStructuralEcho(kind: StructuralKind, path: string): boolean
+	local record = lastStructural[kind .. "|" .. path]
+	return record ~= nil and (os.clock() - record.at) < STRUCTURAL_WINDOW
 end
 
 local function writeSource(inst: Instance, source: string): string?
@@ -171,7 +252,25 @@ local function writeSource(inst: Instance, source: string): string?
 	return tostring(err)
 end
 
-local applyChange: (change: {[string]: any}) -> {[string]: any}
+local function applyWriteTo(inst: Instance, path: string, change: {[string]: any}): {[string]: any}
+	if not inst:IsA("LuaSourceContainer") then
+		return { ok = false, err = string.format("%s is a %s, not a script", path, inst.ClassName) }
+	end
+	local currentHash = hashOf(inst)
+	if type(change.baseHash) == "string" and change.baseHash ~= currentHash then
+		return { ok = false, conflictHash = currentHash }
+	end
+	local source = toLf(if type(change.source) == "string" then change.source else "")
+	local newHash = Hash.content(source)
+	if newHash ~= currentHash then
+		local err = writeSource(inst, source)
+		if err then
+			return { ok = false, err = err }
+		end
+	end
+	markApplied(path, newHash, inst)
+	return { ok = true, hash = newHash }
+end
 
 local function applyCreate(change: {[string]: any}): {[string]: any}
 	local path = change.path
@@ -185,13 +284,13 @@ local function applyCreate(change: {[string]: any}): {[string]: any}
 	end
 	local existing = parent:FindFirstChild(name)
 	if existing then
-		return applyChange({
-			kind = "write",
-			path = path,
-			source = change.source,
-			class = change.class,
-			baseHash = change.baseHash,
-		})
+		-- The daemon sends create without a baseHash whenever it has no shadow
+		-- entry for the path; an instance already sitting there is the "conflict"
+		-- arm of its decide table, never something to overwrite blind.
+		if type(change.baseHash) ~= "string" then
+			return { ok = false, conflictHash = hashOf(existing) }
+		end
+		return applyWriteTo(existing, path, change)
 	end
 	local className = if type(change.class) == "string" then change.class else "ModuleScript"
 	local okNew, created = pcall(function(): Instance
@@ -202,7 +301,7 @@ local function applyCreate(change: {[string]: any}): {[string]: any}
 	end
 	local inst = created :: Instance
 	inst.Name = name
-	local source = if type(change.source) == "string" then change.source else ""
+	local source = toLf(if type(change.source) == "string" then change.source else "")
 	if inst:IsA("LuaSourceContainer") and source ~= "" then
 		local okSource = pcall(function()
 			(inst :: any).Source = source
@@ -215,7 +314,7 @@ local function applyCreate(change: {[string]: any}): {[string]: any}
 	inst.Parent = parent
 	local hash = Hash.content(source)
 	markApplied(path, hash, inst)
-	markStructural(path, inst)
+	markStructural("create", path, inst)
 	return { ok = true, hash = hash }
 end
 
@@ -228,30 +327,18 @@ local function applyWrite(change: {[string]: any}): {[string]: any}
 		end
 		return { ok = false, err = resolveErr or "no instance" }
 	end
-	if not inst:IsA("LuaSourceContainer") then
-		return { ok = false, err = string.format("%s is a %s, not a script", path, inst.ClassName) }
-	end
-	local currentHash = hashOf(inst)
-	if type(change.baseHash) == "string" and change.baseHash ~= currentHash then
-		return { ok = false, conflictHash = currentHash }
-	end
-	local source = if type(change.source) == "string" then change.source else ""
-	local newHash = Hash.content(source)
-	if newHash ~= currentHash then
-		local err = writeSource(inst, source)
-		if err then
-			return { ok = false, err = err }
-		end
-	end
-	markApplied(path, newHash, inst)
-	return { ok = true, hash = newHash }
+	return applyWriteTo(inst, path, change)
 end
 
+-- Deletes are the one change that cannot be undone from the daemon's shadow, so
+-- they only go through on proof: a baseHash that still matches Studio, or
+-- `force = true`, the daemon's explicit "delete anyway" after the user resolved
+-- the conflict. An unversioned delete of live source is refused as a conflict.
 local function applyDelete(change: {[string]: any}): {[string]: any}
 	local path = change.path
 	local inst = Path.resolve(path)
 	if not inst then
-		markStructural(path)
+		markStructural("delete", path)
 		return { ok = true }
 	end
 	if inst == game then
@@ -260,7 +347,15 @@ local function applyDelete(change: {[string]: any}): {[string]: any}
 	if inst.Parent == game and Path.SERVICES[inst.Name] then
 		return { ok = false, err = string.format("refusing to delete service %s", inst.Name) }
 	end
-	markStructural(path, inst)
+	local currentHash = hashOf(inst)
+	if type(change.baseHash) == "string" then
+		if change.baseHash ~= currentHash then
+			return { ok = false, conflictHash = currentHash }
+		end
+	elseif change.force ~= true and inst:IsA("LuaSourceContainer") and sourceOf(inst) ~= "" then
+		return { ok = false, conflictHash = currentHash }
+	end
+	markStructural("delete", path, inst)
 	local ok, err = pcall(function()
 		inst:Destroy()
 	end)
@@ -280,7 +375,7 @@ local function applyRename(change: {[string]: any}): {[string]: any}
 	if not inst then
 		return { ok = false, err = resolveErr or "no instance" }
 	end
-	markStructural(path, inst)
+	markStructural("rename", path, inst)
 	local ok, err = pcall(function()
 		inst.Name = change.newName
 	end)
@@ -288,7 +383,7 @@ local function applyRename(change: {[string]: any}): {[string]: any}
 		return { ok = false, err = tostring(err) }
 	end
 	local newPath = Path.of(inst)
-	markStructural(newPath)
+	markStructural("rename", newPath)
 	local applied = lastApplied[path]
 	if applied then
 		lastApplied[path] = nil
@@ -297,7 +392,7 @@ local function applyRename(change: {[string]: any}): {[string]: any}
 	return { ok = true, path = newPath }
 end
 
-function applyChange(change: {[string]: any}): {[string]: any}
+local function applyChange(change: {[string]: any}): {[string]: any}
 	if type(change) ~= "table" or type(change.path) ~= "string" then
 		return { ok = false, err = "change needs path" }
 	end
@@ -338,7 +433,13 @@ function Applier.snapshot(args: any): {any}
 	if #paths == 0 then
 		error("sync.snapshot needs roots", 0)
 	end
-	Applier.setRoots(paths)
+	-- Seating roots tears down Watcher's connections, and with them every
+	-- debounced edit still waiting to be pushed. Do it on the first snapshot and
+	-- only again when the roots themselves actually change.
+	local instances = resolveRoots(paths)
+	if not rootsUnchanged(paths, instances) then
+		Applier.setRoots(paths)
+	end
 	local entries: {any} = {}
 	local seen: {[Instance]: boolean} = {}
 	local function visit(inst: Instance)
@@ -347,15 +448,19 @@ function Applier.snapshot(args: any): {any}
 		end
 		if inst:IsA("LuaSourceContainer") or inst:IsA("Folder") then
 			seen[inst] = true
+			local path, ambiguous = Path.ofChecked(inst)
 			table.insert(entries, {
-				path = Path.of(inst),
+				path = path,
 				class = inst.ClassName,
 				hash = hashOf(inst),
 				runCtx = runContextOf(inst),
+				-- Duplicate sibling names collapse onto one path: flagged so the
+				-- daemon can skip the row instead of writing one twin over the other.
+				ambiguous = if ambiguous then true else nil,
 			})
 		end
 	end
-	for _, root in rootInstances do
+	for _, root in instances do
 		visit(root)
 		for _, descendant in root:GetDescendants() do
 			visit(descendant)

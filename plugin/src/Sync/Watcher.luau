@@ -88,6 +88,16 @@ local function cancelTimer(inst: Instance)
 	end
 end
 
+-- Re-seating roots disconnects everything, so the debounced changes still being
+-- held have to go out first: cancelling them would drop in-flight user edits.
+local function flushTimers()
+	for inst, pending in timers do
+		task.cancel(pending)
+		timers[inst] = nil
+		emitScriptChanged(inst)
+	end
+end
+
 local function unwatch(inst: Instance)
 	local connections = watched[inst]
 	if connections then
@@ -113,7 +123,7 @@ local function emitRenamed(inst: Instance, oldPath: string)
 			knownPaths[descendant] = Path.of(descendant)
 		end
 	end
-	if Applier.wasEcho(path, nil) or Applier.wasEcho(oldPath, nil) then
+	if Applier.wasStructuralEcho("rename", path) or Applier.wasStructuralEcho("rename", oldPath) then
 		return
 	end
 	Net.pushEvent({ ev = "instRenamed", path = path, oldPath = oldPath })
@@ -153,7 +163,7 @@ local function watch(inst: Instance)
 				end
 				if not isSynced(inst) then
 					unwatch(inst)
-					if not Applier.wasEcho(oldPath, nil) then
+					if not Applier.wasStructuralEcho("delete", oldPath) then
 						Net.pushEvent({ ev = "instRemoved", path = oldPath })
 					end
 					return
@@ -187,7 +197,7 @@ local function attachRoot(root: Instance)
 				end
 				watch(inst)
 				local path = Path.of(inst)
-				if Applier.wasEcho(path, nil) then
+				if Applier.wasStructuralEcho("create", path) then
 					return
 				end
 				Net.pushEvent({ ev = "instAdded", path = path, class = inst.ClassName })
@@ -206,7 +216,7 @@ local function attachRoot(root: Instance)
 			local path = knownPaths[inst] or Path.of(inst)
 			unwatch(inst)
 			task.defer(function()
-				if Applier.wasEcho(path, nil) then
+				if Applier.wasStructuralEcho("delete", path) then
 					return
 				end
 				Net.pushEvent({ ev = "instRemoved", path = path })
@@ -226,6 +236,7 @@ local function detachRoots()
 end
 
 function Watcher.setRoots(newRoots: {Instance})
+	flushTimers()
 	detachRoots()
 	roots = table.clone(newRoots)
 	if not started then
@@ -265,6 +276,8 @@ function Watcher.start()
 	end
 end
 
+-- Roots survive a stop: Applier only re-seats them when the daemon changes the
+-- set, so a reconnect has to be able to re-attach the ones we already know.
 function Watcher.stop()
 	started = false
 	for _, connection in globalConnections do
@@ -275,7 +288,6 @@ function Watcher.stop()
 	for inst in timers do
 		cancelTimer(inst)
 	end
-	roots = {}
 end
 
 return Watcher

@@ -55,8 +55,16 @@ local function tokenize(path: string): ({string}, string?)
 				while j <= length do
 					local inner = string.sub(path, j, j)
 					if inner == "\\" then
-						table.insert(chars, string.sub(path, j + 1, j + 1))
-						j += 2
+						-- quote() escapes exactly `"` and `\`; every other
+						-- backslash is a literal one, not an escape sequence.
+						local escaped = string.sub(path, j + 1, j + 1)
+						if escaped == "\"" or escaped == "\\" then
+							table.insert(chars, escaped)
+							j += 2
+						else
+							table.insert(chars, "\\")
+							j += 1
+						end
 					elseif inner == opener then
 						closed = true
 						break
@@ -216,6 +224,23 @@ function Path.resolve(path: string): (Instance?, string?)
 	return resolved[1], nil
 end
 
+local function hasNamesake(inst: Instance): boolean
+	local parent = inst.Parent
+	if parent == nil then
+		return false
+	end
+	local seen = false
+	for _, child in parent:GetChildren() do
+		if child.Name == inst.Name then
+			if seen then
+				return true
+			end
+			seen = true
+		end
+	end
+	return false
+end
+
 function Path.of(inst: Instance): string
 	if inst == game then
 		return "game"
@@ -235,6 +260,22 @@ function Path.of(inst: Instance): string
 		end
 	end
 	return out
+end
+
+-- Path.of plus "a segment of this path names more than one sibling". Such a path
+-- addresses two instances at once, so callers that map paths to files (sync) must
+-- leave it alone rather than write one twin over the other.
+function Path.ofChecked(inst: Instance): (string, boolean)
+	local ambiguous = false
+	local current: Instance? = inst
+	while current ~= nil and current ~= game do
+		if hasNamesake(current) then
+			ambiguous = true
+			break
+		end
+		current = current.Parent
+	end
+	return Path.of(inst), ambiguous
 end
 
 return Path

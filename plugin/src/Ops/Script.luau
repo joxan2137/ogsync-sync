@@ -17,14 +17,19 @@ local GREP_LIMIT_DEFAULT = 50
 local CONTEXT_LINES = 3
 local SCRIPTS_PER_YIELD = 500
 
-local function splitLines(source: string): { string }
-	local lines = string.split(source, "\n")
-	for index, line in lines do
-		if string.sub(line, -1) == "\r" then
-			lines[index] = string.sub(line, 1, -2)
-		end
+-- Sources and the hashes over them cross the bridge LF-only, matching
+-- normalizeSource() in server/src/proto/types.ts: lines the daemon rejoins with
+-- \n have to hash to exactly what we reported, so normalize once on the way in
+-- and hash, split and return that same text.
+local function toLf(source: string): string
+	if string.find(source, "\r", 1, true) == nil then
+		return source
 	end
-	return lines
+	return (string.gsub(source, "\r\n", "\n"))
+end
+
+local function splitLines(source: string): { string }
+	return string.split(source, "\n")
 end
 
 local function readSource(inst: Instance): string
@@ -36,7 +41,7 @@ local function readSource(inst: Instance): string
 			return document:GetText()
 		end)
 		if textOk and type(text) == "string" then
-			return text
+			return toLf(text)
 		end
 	end
 	local ok, source = pcall(function()
@@ -45,7 +50,7 @@ local function readSource(inst: Instance): string
 	if not ok or type(source) ~= "string" then
 		error("cannot read source of " .. Path.of(inst) .. ": " .. tostring(source))
 	end
-	return source
+	return toLf(source)
 end
 
 local function writeSource(inst: Instance, newSource: string)
@@ -367,13 +372,17 @@ return function(register: Register)
 			error("path must be a string")
 		end
 
+		local oldText = if type(args.old) == "string" then toLf(args.old) else nil
+		local newText = if type(args.new) == "string" then toLf(args.new) else nil
+		local sourceText = if type(args.source) == "string" then toLf(args.source) else nil
+
 		local resolved = Path.resolve(args.path)
 		if resolved then
 			if not resolved:IsA("LuaSourceContainer") then
 				error(args.path .. " is a " .. resolved.ClassName .. ", not a script")
 			end
 			inst = resolved
-		elseif type(args.source) == "string" then
+		elseif sourceText ~= nil then
 			local parentPath, name, splitErr = Path.split(args.path)
 			if not parentPath or not name then
 				error(splitErr or ("cannot derive a parent from " .. args.path))
@@ -401,24 +410,24 @@ return function(register: Register)
 		local center = 1
 		local replacedCount: number? = nil
 
-		if type(args.old) == "string" then
-			if type(args.new) ~= "string" then
+		if oldText ~= nil then
+			if newText == nil then
 				error("old/new edit requires `new`")
 			end
-			local pattern = escapePattern(args.old)
+			local pattern = escapePattern(oldText)
 			local first = string.find(source, pattern)
 			if not first then
 				error("`old` text not found in " .. Path.of(target))
 			end
 			local count: number
 			if args.all == true then
-				newSource, count = string.gsub(source, pattern, escapeReplacement(args.new))
+				newSource, count = string.gsub(source, pattern, escapeReplacement(newText))
 			else
 				local _, occurrences = string.gsub(source, pattern, "")
 				if occurrences > 1 then
 					error("`old` matches " .. occurrences .. " times — pass all=true or extend the snippet")
 				end
-				newSource, count = string.gsub(source, pattern, escapeReplacement(args.new), 1)
+				newSource, count = string.gsub(source, pattern, escapeReplacement(newText), 1)
 			end
 			if count == 0 then
 				error("`old` text not found in " .. Path.of(target))
@@ -426,7 +435,7 @@ return function(register: Register)
 			replacedCount = count
 			center = lineOfOffset(source, first)
 		elseif type(args.lines) == "table" then
-			if type(args.new) ~= "string" then
+			if newText == nil then
 				error("lines edit requires `new` (\"\" deletes)")
 			end
 			local lines = splitLines(source)
@@ -439,8 +448,8 @@ return function(register: Register)
 			for index = 1, first - 1 do
 				table.insert(out, lines[index])
 			end
-			if args.new ~= "" then
-				for _, line in splitLines(args.new) do
+			if newText ~= "" then
+				for _, line in splitLines(newText) do
 					table.insert(out, line)
 				end
 			end
@@ -450,7 +459,7 @@ return function(register: Register)
 			newSource = table.concat(out, "\n")
 			center = first
 		elseif args.insert_after ~= nil then
-			if type(args.new) ~= "string" then
+			if newText == nil then
 				error("insert_after edit requires `new`")
 			end
 			local lines = splitLines(source)
@@ -459,7 +468,7 @@ return function(register: Register)
 			for index = 1, after do
 				table.insert(out, lines[index])
 			end
-			for _, line in splitLines(args.new) do
+			for _, line in splitLines(newText) do
 				table.insert(out, line)
 			end
 			for index = after + 1, #lines do
@@ -467,8 +476,8 @@ return function(register: Register)
 			end
 			newSource = table.concat(out, "\n")
 			center = after + 1
-		elseif type(args.source) == "string" then
-			newSource = args.source
+		elseif sourceText ~= nil then
+			newSource = sourceText
 			center = 1
 		else
 			error("edit needs exactly one of old/new, lines, insert_after or source")
