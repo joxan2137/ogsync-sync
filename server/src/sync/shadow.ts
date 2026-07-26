@@ -1,7 +1,7 @@
 // Last-synced state per instance. Both sides diff against the shadow, never
 // against each other — that is what makes conflicts detectable.
 
-import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { mkdir, open, readFile, rename } from "node:fs/promises";
 import { join } from "node:path";
 
 export interface ShadowEntry {
@@ -26,32 +26,63 @@ function isEntry(v: unknown): v is ShadowEntry {
   return typeof e.hash === "string" && typeof e.file === "string" && typeof e.class === "string";
 }
 
+/**
+ * Write-then-rename with the temp file fsynced first: without the sync a crash
+ * can land the rename while the data is still in the page cache, leaving a
+ * durable name over zeroed content.
+ */
+export async function writeDurable(target: string, body: string, tmp: string): Promise<void> {
+  const fh = await open(tmp, "w");
+  try {
+    await fh.write(body, 0, "utf8");
+    await fh.sync();
+  } finally {
+    await fh.close();
+  }
+  await rename(tmp, target);
+}
+
 export class ShadowStore {
   readonly #entries: Map<string, ShadowEntry>;
 
   private constructor(
     readonly dir: string,
     entries: Map<string, ShadowEntry>,
+    /** Where a corrupt shadow was moved aside, or null when the load was clean. */
+    readonly corrupt: string | null,
   ) {
     this.#entries = entries;
   }
 
-  /** Loads `<projectDir>/.ogsync/shadow.json`, or an empty store. */
+  /**
+   * Loads `<projectDir>/.ogsync/shadow.json`, or an empty store. An absent file
+   * means "nothing synced yet"; an unparseable one means the base state is lost
+   * — it is renamed aside and reported via `corrupt` so the engine can refuse to
+   * destroy either side.
+   */
   static async load(projectDir: string): Promise<ShadowStore> {
+    const target = ShadowStore.pathOf(projectDir);
     const entries = new Map<string, ShadowEntry>();
+    let raw: string;
     try {
-      const raw = await readFile(ShadowStore.pathOf(projectDir), "utf8");
-      const doc: unknown = JSON.parse(raw);
-      const bag = (doc as ShadowDoc | null)?.entries;
-      if (typeof bag === "object" && bag !== null) {
-        for (const [path, entry] of Object.entries(bag)) {
-          if (isEntry(entry)) entries.set(path, entry);
-        }
-      }
+      raw = await readFile(target, "utf8");
     } catch {
-      // absent or corrupt shadow ⇒ start empty; reconcile rebuilds it
+      return new ShadowStore(projectDir, entries, null);
     }
-    return new ShadowStore(projectDir, entries);
+    let bag: unknown;
+    try {
+      bag = (JSON.parse(raw) as ShadowDoc | null)?.entries;
+    } catch {
+      const aside = `${target}.corrupt-${Date.now()}`;
+      await rename(target, aside).catch(() => undefined);
+      return new ShadowStore(projectDir, entries, aside);
+    }
+    if (typeof bag === "object" && bag !== null) {
+      for (const [path, entry] of Object.entries(bag)) {
+        if (isEntry(entry)) entries.set(path, entry);
+      }
+    }
+    return new ShadowStore(projectDir, entries, null);
   }
 
   static pathOf(projectDir: string): string {
@@ -93,16 +124,14 @@ export class ShadowStore {
     return null;
   }
 
-  /** Atomic: write a temp sibling, then rename over the target. */
+  /** Atomic and durable: write a temp sibling, fsync it, then rename over. */
   async save(): Promise<void> {
     const target = ShadowStore.pathOf(this.dir);
-    const tmp = `${target}.${process.pid}.tmp`;
     const doc: ShadowDoc = { version: FORMAT, entries: {} };
     for (const path of [...this.#entries.keys()].sort()) {
       doc.entries[path] = this.#entries.get(path) as ShadowEntry;
     }
     await mkdir(join(this.dir, SHADOW_DIR), { recursive: true });
-    await writeFile(tmp, `${JSON.stringify(doc, null, 2)}\n`, "utf8");
-    await rename(tmp, target);
+    await writeDurable(target, `${JSON.stringify(doc, null, 2)}\n`, `${target}.${process.pid}.tmp`);
   }
 }

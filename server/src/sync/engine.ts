@@ -2,12 +2,13 @@
 // (never fs-vs-Studio directly), so "changed on both sides" is detectable and
 // nothing is deleted that holds unsynced work.
 
-import { mkdir, readFile, rename, rmdir, stat, unlink, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rename, rmdir, stat, unlink } from "node:fs/promises";
 import type { Stats } from "node:fs";
 import { basename, dirname, isAbsolute, join, relative } from "node:path";
 import {
   BridgeError,
   contentHash,
+  normalizeSource,
   type Bridge,
   type BridgeEvent,
   type ConflictInfo,
@@ -25,10 +26,11 @@ import {
   isUnder,
   loadProject,
   matchSuffix,
+  type FsEntry,
   type NodeKind,
   type ProjectMap,
 } from "./project.ts";
-import { ShadowStore } from "./shadow.ts";
+import { ShadowStore, writeDurable, type ShadowEntry } from "./shadow.ts";
 import { FsWatcher, silentLogger, type FsEvent, type SyncLogger } from "./watcher.ts";
 
 export type { SyncLogger } from "./watcher.ts";
@@ -37,6 +39,10 @@ export type { SyncLogger } from "./watcher.ts";
 export const COALESCE_MS = 300;
 /** Bridge has no bind callback; the engine samples bound() at this interval. */
 export const BIND_POLL_MS = 1000;
+/** Synthetic conflict key reporting a lost shadow through SyncStatus.conflicts. */
+export const SAFE_MODE_KEY = "safe-mode";
+/** Distinct backup names to try for one file within one millisecond. */
+const BACKUP_TRIES = 64;
 
 export interface SyncEngineOptions {
   logger?: SyncLogger;
@@ -112,6 +118,28 @@ interface PendingChange {
 
 type Winner = "fs" | "studio" | "manual";
 
+/**
+ * Result of saving a copy before destroying the original. `saved` false means
+ * the file is on disk but could not be copied — nothing may overwrite or delete
+ * it. `file` is undefined when there was nothing to save.
+ */
+interface Backup {
+  saved: boolean;
+  file?: string;
+}
+
+interface PushTally {
+  written: number;
+  deleted: number;
+  backed: number;
+  refused: number;
+}
+
+function tallyApplied(tally: PushTally, p: PendingChange): void {
+  if (p.hash === null) tally.deleted++;
+  else tally.written++;
+}
+
 function isRecord(v: unknown): v is Record<string, unknown> {
   return typeof v === "object" && v !== null;
 }
@@ -131,11 +159,21 @@ function promotedDirOf(rel: string): string | null {
   return matchSuffix(rel.slice(slash + 1))?.name === "init" ? rel.slice(0, slash) : null;
 }
 
-function backupPathFor(rel: string, ts: number): string {
-  const base = rel.slice(rel.lastIndexOf("/") + 1);
-  const conv = matchSuffix(base);
-  const stem = conv === null ? rel : rel.slice(0, rel.length - (base.length - conv.name.length));
-  return `${stem}.conflict-${ts}.luau`;
+/**
+ * Backup name for one attempt. The whole original name stays in the stem so
+ * `Foo.luau` and `Foo.server.luau` can never share a backup, and `nth > 1`
+ * numbers a same-millisecond collision instead of overwriting the earlier copy.
+ */
+function backupPathFor(rel: string, ts: number, nth: number): string {
+  return nth === 1 ? `${rel}.conflict-${ts}.luau` : `${rel}.conflict-${ts}-${nth}.luau`;
+}
+
+/** Why a `script.read` result is a partial view, or null when it is whole. */
+function truncationOf(data: unknown): string | null {
+  if (!isRecord(data)) return null;
+  if (data.truncated === true) return "plugin reported truncated";
+  if (typeof data.total !== "number" || !Array.isArray(data.lines)) return null;
+  return data.total > data.lines.length ? `${data.lines.length} of ${data.total} lines` : null;
 }
 
 function normalizeApply(data: unknown, count: number): ApplyResult[] {
@@ -201,8 +239,10 @@ export class SyncEngine implements SyncControl {
 
   readonly #fsQueue = new Map<string, FsEvent>();
   readonly #studioQueue = new Map<string, BridgeEvent>();
+  /** Daemon receive time per instance path — never a Studio wall clock. */
   readonly #studioTs = new Map<string, number>();
   readonly #conflicts = new Map<string, ConflictInfo>();
+  readonly #mappingNotices = new Set<string>();
 
   #project: ProjectMap | null = null;
   #shadow: ShadowStore | null = null;
@@ -214,6 +254,7 @@ export class SyncEngine implements SyncControl {
   #boundSession: string | null = null;
   #paused = false;
   #started = false;
+  #safeMode = false;
 
   constructor(bridge: Bridge, config: OgsyncConfig, projectDir: string, opts: SyncEngineOptions = {}) {
     this.#bridge = bridge;
@@ -233,8 +274,10 @@ export class SyncEngine implements SyncControl {
     }
     const project = loadProject(this.#dir, this.#config.project.file);
     this.#project = project;
-    this.#shadow = await ShadowStore.load(this.#dir);
-    project.scanFs();
+    const shadow = await ShadowStore.load(this.#dir);
+    this.#shadow = shadow;
+    if (shadow.corrupt !== null) this.#enterSafeMode(shadow.corrupt);
+    this.#scan();
     this.#noticeIgnored();
     this.#unsubscribe = this.#bridge.onEvent((ev, from) => this.#onStudioEvent(ev, from));
     this.#watcher = new FsWatcher({
@@ -308,12 +351,13 @@ export class SyncEngine implements SyncControl {
       const project = this.#proj();
       const shadow = this.#shad();
       const studio = await this.#snapshot(project.syncRoots());
-      const fs = project.scanFs();
+      const fs = this.#scan();
       const ts = this.#now();
       let created = 0;
       let written = 0;
       let backed = 0;
       let folders = 0;
+      let refused = 0;
       for (const [path, entry] of byPath(studio)) {
         const local = fs.get(path);
         const file =
@@ -336,7 +380,14 @@ export class SyncEngine implements SyncControl {
           shadow.set(path, { hash, file, class: entry.class });
           continue;
         } else {
-          if ((await this.#backupLocal(file, ts)) !== undefined) backed++;
+          const backup = await this.#backupLocal(file, ts);
+          if (!backup.saved) {
+            this.#log.warn(`sync: kept ${file}: could not back it up before overwriting`);
+            this.#noteConflict(file, path, ts, "pending");
+            refused++;
+            continue;
+          }
+          if (backup.file !== undefined) backed++;
           written++;
         }
         await this.#writeLocal(file, source);
@@ -344,7 +395,8 @@ export class SyncEngine implements SyncControl {
       }
       const extra = [...fs.keys()].filter((p) => !studio.has(p));
       await shadow.save();
-      return `pull: ${created} created, ${written} overwritten (${backed} backed up), ${folders} folders, ${extra.length} fs-only kept`;
+      const kept = refused === 0 ? "" : `, ${refused} kept (no backup)`;
+      return `pull: ${created} created, ${written} overwritten (${backed} backed up)${kept}, ${folders} folders, ${extra.length} fs-only kept`;
     });
   }
 
@@ -353,8 +405,11 @@ export class SyncEngine implements SyncControl {
       const project = this.#proj();
       const shadow = this.#shad();
       const studio = await this.#snapshot(project.syncRoots());
-      const fs = project.scanFs();
+      const fs = this.#scan();
+      const ts = this.#now();
       const pending: PendingChange[] = [];
+      let saved = 0;
+      let held = 0;
       for (const [path, entry] of byPath(fs)) {
         const remote = studio.get(path);
         if (remote !== undefined && remote.hash === entry.hash) {
@@ -371,19 +426,26 @@ export class SyncEngine implements SyncControl {
           });
           continue;
         }
+        const rescue = await this.#rescueStudio(path, entry.file, remote, shadow.get(path), ts);
+        if (rescue === "held") {
+          held++;
+          continue;
+        }
+        if (rescue === "saved") saved++;
         pending.push({
           change: {
             kind: remote === undefined ? "create" : "write",
             path,
             class: entry.class,
             source: entry.source,
+            // Snapshot hash: the plugin's guard fires if Studio moved mid-push.
+            ...(remote === undefined ? {} : { baseHash: remote.hash }),
           },
           file: entry.file,
           class: entry.class,
           hash: entry.hash,
         });
       }
-      let dropped = 0;
       let extra = 0;
       for (const path of [...studio.keys()].sort()) {
         if (fs.has(path)) continue;
@@ -392,17 +454,32 @@ export class SyncEngine implements SyncControl {
           extra++;
           continue;
         }
+        const remote = studio.get(path);
+        const rescue = await this.#rescueStudio(path, known.file, remote, known, ts);
+        if (rescue === "held") {
+          held++;
+          continue;
+        }
+        if (rescue === "saved") saved++;
         pending.push({
-          change: { kind: "delete", path },
+          change: {
+            kind: "delete",
+            path,
+            ...(remote === undefined ? {} : { baseHash: remote.hash }),
+          },
           file: known.file,
           class: known.class,
           hash: null,
         });
-        dropped++;
       }
-      await this.#pushChanges(pending);
+      const tally = await this.#pushForce(pending);
       await shadow.save();
-      return `push: ${pending.length - dropped} written, ${dropped} deleted, ${extra} studio-only kept`;
+      const backed = saved + tally.backed;
+      const refused = held + tally.refused;
+      return (
+        `push: ${tally.written} written, ${tally.deleted} deleted, ` +
+        `${backed} studio version(s) backed up, ${refused} refused, ${extra} studio-only kept`
+      );
     });
   }
 
@@ -441,17 +518,24 @@ export class SyncEngine implements SyncControl {
           },
         ]);
         await shadow.save();
+        this.#studioTs.delete(path);
         this.#clearConflict(rel, ts, "kept-fs");
         return `resolved ${rel}: kept fs → ${path} (${hash})`;
       }
       const source = await this.#fetchSource(path);
       if (source === null) throw new BridgeError("STUDIO", `could not read ${path}`);
+      const backup = await this.#backupLocal(rel, ts);
+      if (!backup.saved) {
+        throw new BridgeError("STUDIO", `could not back up ${rel} before overwriting it`);
+      }
       await this.#writeLocal(rel, source);
       const hash = contentHash(source);
       shadow.set(path, { hash, file: rel, class: cls });
       await shadow.save();
+      this.#studioTs.delete(path);
       this.#clearConflict(rel, ts, "kept-studio");
-      return `resolved ${rel}: kept Studio → ${rel} (${hash})`;
+      const kept = backup.file === undefined ? "" : ` (fs version at ${backup.file})`;
+      return `resolved ${rel}: kept Studio → ${rel} (${hash})${kept}`;
     });
   }
 
@@ -467,7 +551,7 @@ export class SyncEngine implements SyncControl {
       return;
     }
     const studio = await this.#snapshot(roots);
-    const fs = project.scanFs();
+    const fs = this.#scan();
     const paths = new Set([...fs.keys(), ...shadow.paths(), ...studio.keys()]);
     const pending: PendingChange[] = [];
     const conflicted: { path: string; pending: PendingChange; studioHash: string }[] = [];
@@ -546,9 +630,9 @@ export class SyncEngine implements SyncControl {
     }
     await this.#pushChanges(pending);
     for (const c of conflicted) {
-      // No Studio timestamp exists at reconcile: prefer-newest degrades to
+      // No receive time exists for a snapshot: prefer-newest degrades to
       // prefer-fs, with the Studio version kept as a .conflict backup.
-      await this.#conflictFsSide(c.pending, c.studioHash, undefined);
+      await this.#conflictFsSide(c.pending, c.studioHash);
     }
     await shadow.save();
     const summary = [...tally]
@@ -584,7 +668,11 @@ export class SyncEngine implements SyncControl {
     if (path === null || this.#project === null) return;
     const roots = this.#project.syncRoots();
     if (!roots.some((root) => isUnder(path, root))) return;
-    if (ev.ev === "scriptChanged") this.#studioTs.set(path, ev.ts);
+    // ambiguous mapping: reported at scan time, never synced in either direction
+    if (this.#project.duplicatePaths().has(path)) return;
+    // Studio's wall clock is not comparable with local mtimes; the arrival time
+    // here is, so prefer-newest is decided against this and never against ev.ts.
+    if (ev.ev === "scriptChanged") this.#studioTs.set(path, this.#now());
     this.#studioQueue.set(`${ev.ev}:${path}`, ev);
     this.#schedule();
   }
@@ -666,17 +754,24 @@ export class SyncEngine implements SyncControl {
       const mapped = project.fileToInst(ev.file);
       // Folders and unsupported types only ever come from a full scan.
       if (mapped === null || mapped.class === FOLDER_CLASS) continue;
+      if (project.duplicatePaths().has(mapped.path)) continue;
       const base = shadow.get(mapped.path);
       if (ev.kind === "deleted") {
-        if (base === undefined) continue;
-        pending.push({
-          change: { kind: "delete", path: mapped.path, baseHash: base.hash },
-          file: ev.file,
-          class: base.class,
-          hash: null,
-        });
-        queued.add(mapped.path);
-        continue;
+        // Save-by-unlink+recreate editors and sweep races report deletes for
+        // files that are right back on disk: only a fresh stat may condemn an
+        // instance and everything under it.
+        if ((await this.#statOf(ev.file)) === null) {
+          if (base === undefined) continue;
+          pending.push({
+            change: { kind: "delete", path: mapped.path, baseHash: base.hash },
+            file: ev.file,
+            class: base.class,
+            hash: null,
+          });
+          queued.add(mapped.path);
+          continue;
+        }
+        this.#log.info(`sync: ${ev.file} is back on disk; treating its delete as a change`);
       }
       const source = await this.#readLocal(ev.file);
       if (source === null) continue;
@@ -724,7 +819,7 @@ export class SyncEngine implements SyncControl {
         continue;
       }
       if (res.conflictHash !== undefined) {
-        await this.#conflictFsSide(p, res.conflictHash, this.#studioTs.get(p.change.path));
+        await this.#conflictFsSide(p, res.conflictHash);
         continue;
       }
       this.#log.warn(
@@ -733,12 +828,66 @@ export class SyncEngine implements SyncControl {
     }
   }
 
+  /**
+   * `fullPush` variant: fs always wins, but a guard rejection means Studio moved
+   * after the snapshot, so its version is fetched and saved before the retry.
+   */
+  async #pushForce(pending: PendingChange[]): Promise<PushTally> {
+    const tally: PushTally = { written: 0, deleted: 0, backed: 0, refused: 0 };
+    if (pending.length === 0) return tally;
+    const ts = this.#now();
+    const results = await this.#callApply(pending.map((p) => p.change));
+    const retry: PendingChange[] = [];
+    for (const [i, p] of pending.entries()) {
+      const res = results[i] ?? { ok: false, err: "no result" };
+      const path = p.change.path;
+      if (res.ok) {
+        this.#record(p);
+        tallyApplied(tally, p);
+        continue;
+      }
+      if (res.conflictHash === undefined) {
+        tally.refused++;
+        this.#log.warn(`sync: studio rejected ${p.change.kind} ${path}: ${res.err ?? "unknown"}`);
+        continue;
+      }
+      const studioSource = await this.#fetchSource(path);
+      const backup =
+        studioSource === null ? undefined : await this.#backupStudio(p.file, studioSource, ts);
+      if (backup === undefined) {
+        tally.refused++;
+        this.#log.warn(`sync: left ${path} alone: could not save the Studio version first`);
+        this.#noteConflict(p.file, path, ts, "pending");
+        continue;
+      }
+      tally.backed++;
+      this.#noteConflict(p.file, path, ts, "kept-fs", backup);
+      retry.push({ ...p, change: { ...p.change, baseHash: res.conflictHash } });
+    }
+    if (retry.length === 0) return tally;
+    const forced = await this.#callApply(retry.map((p) => p.change));
+    for (const [i, p] of retry.entries()) {
+      if (forced[i]?.ok === true) {
+        this.#record(p);
+        tallyApplied(tally, p);
+        continue;
+      }
+      tally.refused++;
+      this.#log.warn(
+        `sync: forced ${p.change.kind} ${p.change.path} rejected: ${forced[i]?.err ?? "unknown"}`,
+      );
+    }
+    return tally;
+  }
+
   async #callApply(changes: SyncChange[]): Promise<ApplyResult[]> {
     const data = await this.#bridge.call("sync.apply", { changes });
     return normalizeApply(data, changes.length);
   }
 
   #record(p: PendingChange): void {
+    // Both sides now agree: a stale receive time must not decide a later conflict.
+    this.#studioTs.delete(p.change.path);
     if (p.hash === null) {
       this.#forget(p.change.path);
       return;
@@ -752,7 +901,7 @@ export class SyncEngine implements SyncControl {
     try {
       switch (ev.ev) {
         case "scriptChanged":
-          await this.#studioWrite(ev.path, ev.hash, ev.source, ev.ts);
+          await this.#studioWrite(ev.path, ev.hash, ev.source);
           break;
         case "instAdded":
           await this.#studioAdd(ev.path, ev.class);
@@ -775,7 +924,6 @@ export class SyncEngine implements SyncControl {
     path: string,
     hash: string,
     source: string | undefined,
-    studioTs: number | undefined,
     cls?: string,
   ): Promise<void> {
     const project = this.#proj();
@@ -790,10 +938,11 @@ export class SyncEngine implements SyncControl {
       const localHash = contentHash(local);
       if (localHash === hash) {
         shadow.set(path, { hash, file, class: klass });
+        this.#studioTs.delete(path);
         return;
       }
       if (base === undefined || localHash !== base.hash) {
-        await this.#conflictStudioSide(path, file, klass, hash, source, studioTs);
+        await this.#conflictStudioSide(path, file, klass, hash, source);
         return;
       }
     }
@@ -801,6 +950,7 @@ export class SyncEngine implements SyncControl {
     if (src === null) return;
     await this.#writeLocal(file, src);
     shadow.set(path, { hash: contentHash(src), file, class: klass });
+    this.#studioTs.delete(path);
   }
 
   async #studioAdd(path: string, cls: string): Promise<void> {
@@ -814,7 +964,8 @@ export class SyncEngine implements SyncControl {
     }
     const source = await this.#fetchSource(path);
     if (source === null) return;
-    await this.#studioWrite(path, contentHash(source), source, this.#now(), cls);
+    this.#studioTs.set(path, this.#now());
+    await this.#studioWrite(path, contentHash(source), source, cls);
   }
 
   async #studioRemove(path: string): Promise<void> {
@@ -866,6 +1017,20 @@ export class SyncEngine implements SyncControl {
       await this.#studioAdd(newPath, cls);
       return;
     }
+    // rename() replaces the destination on both platforms: whatever is already
+    // there must be saved first, or refused outright when it cannot be.
+    if ((await this.#statOf(newTarget)) !== null) {
+      const ts = this.#now();
+      const backup = await this.#backupLocal(newTarget, ts);
+      if (!backup.saved) {
+        this.#log.warn(
+          `sync: refusing rename ${oldTarget} → ${newTarget}: could not back up the existing file`,
+        );
+        this.#noteConflict(newTarget, newPath, ts, "pending");
+        return;
+      }
+      this.#noteConflict(newTarget, newPath, ts, "kept-studio", backup.file);
+    }
     await mkdir(dirname(join(this.#dir, newTarget)), { recursive: true });
     await rename(join(this.#dir, oldTarget), join(this.#dir, newTarget));
     for (const [path, entry] of shadow.entries()) {
@@ -901,6 +1066,7 @@ export class SyncEngine implements SyncControl {
   // ------------------------------------------------------------- conflicts
 
   #policyWinner(fileMtimeMs: number | null, studioTs: number | undefined): Winner {
+    if (this.#safeMode) return "manual"; // no trustworthy base: destroy nothing
     switch (this.#config.sync.conflict) {
       case "prefer-fs":
         return "fs";
@@ -915,34 +1081,42 @@ export class SyncEngine implements SyncControl {
   }
 
   /** An fs-originated change the plugin rejected: Studio moved under us. */
-  async #conflictFsSide(
-    p: PendingChange,
-    studioHash: string,
-    studioTs: number | undefined,
-  ): Promise<void> {
+  async #conflictFsSide(p: PendingChange, studioHash: string): Promise<void> {
     const path = p.change.path;
     const studioSource = await this.#fetchSource(path);
-    const winner = this.#policyWinner(await this.#mtimeOf(p.file), studioTs);
+    const winner = this.#policyWinner(await this.#mtimeOf(p.file), this.#studioTs.get(path));
     const ts = this.#now();
+    if (studioSource === null) {
+      // Nothing may overwrite or delete a Studio version we could not read.
+      this.#log.warn(`sync: cannot resolve ${p.file}: Studio source unavailable`);
+      this.#noteConflict(p.file, path, ts, "pending");
+      return;
+    }
     if (winner === "studio") {
-      if (studioSource === null) {
-        this.#log.warn(`sync: cannot resolve ${p.file}: Studio source unavailable`);
+      const backup = await this.#backupLocal(p.file, ts);
+      if (!backup.saved) {
+        this.#log.warn(`sync: kept ${p.file}: could not back it up before overwriting`);
+        this.#noteConflict(p.file, path, ts, "pending");
         return;
       }
-      const backup = await this.#backupLocal(p.file, ts);
       await this.#writeLocal(p.file, studioSource);
       this.#shad().set(path, {
         hash: contentHash(studioSource),
         file: p.file,
         class: p.class,
       });
-      this.#noteConflict(p.file, path, ts, "kept-studio", backup);
+      this.#studioTs.delete(path);
+      this.#noteConflict(p.file, path, ts, "kept-studio", backup.file);
       return;
     }
-    const backup =
-      studioSource === null ? undefined : await this.#backup(p.file, studioSource, ts);
+    const backup = await this.#backupStudio(p.file, studioSource, ts);
     if (winner === "manual") {
       this.#noteConflict(p.file, path, ts, "pending", backup);
+      return;
+    }
+    if (backup === undefined) {
+      this.#log.warn(`sync: not forcing ${p.change.kind} ${path}: Studio version not saved`);
+      this.#noteConflict(p.file, path, ts, "pending");
       return;
     }
     const forced: PendingChange = { ...p, change: { ...p.change, baseHash: studioHash } };
@@ -962,25 +1136,36 @@ export class SyncEngine implements SyncControl {
     cls: string,
     studioHash: string,
     source: string | undefined,
-    studioTs: number | undefined,
   ): Promise<void> {
-    const winner = this.#policyWinner(await this.#mtimeOf(file), studioTs);
+    const winner = this.#policyWinner(await this.#mtimeOf(file), this.#studioTs.get(path));
     const ts = this.#now();
     const studioSource = source ?? (await this.#fetchSource(path));
-    if (winner === "studio") {
-      if (studioSource === null) {
-        this.#log.warn(`sync: cannot resolve ${file}: Studio source unavailable`);
-        return;
-      }
-      const backup = await this.#backupLocal(file, ts);
-      await this.#writeLocal(file, studioSource);
-      this.#shad().set(path, { hash: contentHash(studioSource), file, class: cls });
-      this.#noteConflict(file, path, ts, "kept-studio", backup);
+    if (studioSource === null) {
+      this.#log.warn(`sync: cannot resolve ${file}: Studio source unavailable`);
+      this.#noteConflict(file, path, ts, "pending");
       return;
     }
-    const backup = studioSource === null ? undefined : await this.#backup(file, studioSource, ts);
+    if (winner === "studio") {
+      const backup = await this.#backupLocal(file, ts);
+      if (!backup.saved) {
+        this.#log.warn(`sync: kept ${file}: could not back it up before overwriting`);
+        this.#noteConflict(file, path, ts, "pending");
+        return;
+      }
+      await this.#writeLocal(file, studioSource);
+      this.#shad().set(path, { hash: contentHash(studioSource), file, class: cls });
+      this.#studioTs.delete(path);
+      this.#noteConflict(file, path, ts, "kept-studio", backup.file);
+      return;
+    }
+    const backup = await this.#backupStudio(file, studioSource, ts);
     if (winner === "manual") {
       this.#noteConflict(file, path, ts, "pending", backup);
+      return;
+    }
+    if (backup === undefined) {
+      this.#log.warn(`sync: not forcing write ${path}: Studio version not saved`);
+      this.#noteConflict(file, path, ts, "pending");
       return;
     }
     const local = await this.#readLocal(file);
@@ -1011,8 +1196,13 @@ export class SyncEngine implements SyncControl {
     const ts = this.#now();
     if (winner === "studio") {
       const backup = await this.#backupLocal(file, ts);
+      if (!backup.saved) {
+        this.#log.warn(`sync: kept ${file}: could not back it up before deleting`);
+        this.#noteConflict(file, path, ts, "pending");
+        return;
+      }
       if (await this.#deleteLocal(file)) this.#forget(path);
-      this.#noteConflict(file, path, ts, "kept-studio", backup);
+      this.#noteConflict(file, path, ts, "kept-studio", backup.file);
       return;
     }
     if (winner === "manual") {
@@ -1039,6 +1229,7 @@ export class SyncEngine implements SyncControl {
   ): void {
     const info: ConflictInfo = { file, path, ts, resolution };
     if (backupFile !== undefined) info.backupFile = backupFile;
+    if (resolution !== "pending") this.#studioTs.delete(path);
     this.#conflicts.set(file, info);
     const where = backupFile === undefined ? "" : ` (backup ${backupFile})`;
     this.#log.warn(`sync: conflict ${file} ⇄ ${path} → ${resolution}${where}`);
@@ -1090,6 +1281,51 @@ export class SyncEngine implements SyncControl {
     for (const tracked of shadow.paths()) {
       if (isUnder(tracked, path)) shadow.delete(tracked);
     }
+  }
+
+  /** Full scan plus the one-shot notices for anything it could not map cleanly. */
+  #scan(): Map<string, FsEntry> {
+    const project = this.#proj();
+    const entries = project.scanFs();
+    const ts = this.#now();
+    let noted = false;
+    for (const [path, files] of project.duplicatePaths()) {
+      if (this.#mappingNotices.has(path)) continue;
+      this.#mappingNotices.add(path);
+      this.#log.warn(`sync: ${files.join(" and ")} both map to ${path}; excluding it from sync`);
+      const file = files[0] ?? path;
+      this.#conflicts.set(file, { file, path, ts, resolution: "pending" });
+      noted = true;
+    }
+    for (const [file, segment] of project.unsyncableFiles()) {
+      if (this.#mappingNotices.has(file)) continue;
+      this.#mappingNotices.add(file);
+      this.#log.warn(
+        `sync: not syncing ${file}: "${segment}" has a control character the path grammar cannot carry`,
+      );
+    }
+    if (noted) this.#pushConflicts();
+    return entries;
+  }
+
+  /**
+   * The shadow was unreadable, so no base state exists to diff against: run
+   * every divergence as a manual conflict and surface it through the conflict
+   * list (SyncStatus carries no dedicated field).
+   */
+  #enterSafeMode(corruptFile: string): void {
+    this.#safeMode = true;
+    const aside = this.#toRel(corruptFile);
+    this.#log.warn(
+      `sync: shadow state was corrupt (kept as ${aside}); safe mode — divergent files ` +
+        `become pending conflicts, nothing is overwritten or deleted`,
+    );
+    this.#conflicts.set(SAFE_MODE_KEY, {
+      file: SAFE_MODE_KEY,
+      path: aside,
+      ts: this.#now(),
+      resolution: "pending",
+    });
   }
 
   #noticeIgnored(): void {
@@ -1144,9 +1380,15 @@ export class SyncEngine implements SyncControl {
     try {
       // limit must cover any script; the plugin default of 200 lines would
       // silently truncate what we write to disk.
-      const source = pickSource(
-        await this.#bridge.call("script.read", { path, limit: 1_000_000 }),
-      );
+      const data = await this.#bridge.call("script.read", { path, limit: 1_000_000 });
+      const partial = truncationOf(data);
+      if (partial !== null) {
+        // A partial source must never reach disk or the shadow: recording its
+        // hash would make the truncation look like the agreed state.
+        this.#log.warn(`sync: script.read ${path} came back partial (${partial}); ignoring it`);
+        return null;
+      }
+      const source = pickSource(data);
       if (source === null) this.#log.warn(`sync: script.read returned no source for ${path}`);
       return source;
     } catch (e) {
@@ -1155,9 +1397,10 @@ export class SyncEngine implements SyncControl {
     }
   }
 
+  /** In-memory copy only: hashes must match the plugin's LF-only ones. */
   async #readLocal(rel: string): Promise<string | null> {
     try {
-      return await readFile(join(this.#dir, rel), "utf8");
+      return normalizeSource(await readFile(join(this.#dir, rel), "utf8"));
     } catch {
       return null;
     }
@@ -1167,20 +1410,65 @@ export class SyncEngine implements SyncControl {
     const abs = join(this.#dir, rel);
     await mkdir(dirname(abs), { recursive: true });
     // dot-prefixed temp: the watcher ignores dotfiles, so no echo event
-    const tmp = join(dirname(abs), `.${basename(abs)}.ogsync-tmp`);
-    await writeFile(tmp, source, "utf8");
-    await rename(tmp, abs);
+    await writeDurable(abs, source, join(dirname(abs), `.${basename(abs)}.ogsync-tmp`));
   }
 
+  /** Never overwrites an earlier backup, however close together they land. */
   async #backup(rel: string, source: string, ts: number): Promise<string> {
-    const target = backupPathFor(rel, ts);
-    await this.#writeLocal(target, source);
-    return target;
+    for (let nth = 1; nth <= BACKUP_TRIES; nth++) {
+      const target = backupPathFor(rel, ts, nth);
+      if ((await this.#statOf(target)) !== null) continue;
+      await this.#writeLocal(target, source);
+      return target;
+    }
+    throw new Error(`no free backup name for ${rel} at ${ts}`);
   }
 
-  async #backupLocal(rel: string, ts: number): Promise<string | undefined> {
+  /** Copy of the local file, taken before anything overwrites or deletes it. */
+  async #backupLocal(rel: string, ts: number): Promise<Backup> {
     const source = await this.#readLocal(rel);
-    return source === null ? undefined : this.#backup(rel, source, ts);
+    if (source === null) return { saved: (await this.#statOf(rel)) === null };
+    try {
+      return { saved: true, file: await this.#backup(rel, source, ts) };
+    } catch (e) {
+      this.#log.warn(`sync: could not back up ${rel}: ${msgOf(e)}`);
+      return { saved: false };
+    }
+  }
+
+  /** Copy of the Studio version, taken before an fs write overwrites it. */
+  async #backupStudio(rel: string, source: string, ts: number): Promise<string | undefined> {
+    try {
+      return await this.#backup(rel, source, ts);
+    } catch (e) {
+      this.#log.warn(`sync: could not save the Studio copy of ${rel}: ${msgOf(e)}`);
+      return undefined;
+    }
+  }
+
+  /**
+   * Saves Studio content that diverged from the shadow before a full push
+   * overwrites or deletes it. "held" means the push must skip this path.
+   */
+  async #rescueStudio(
+    path: string,
+    file: string,
+    remote: StudioEntry | undefined,
+    base: ShadowEntry | undefined,
+    ts: number,
+  ): Promise<"clean" | "saved" | "held"> {
+    if (remote === undefined || remote.class === FOLDER_CLASS) return "clean";
+    if (remote.hash === base?.hash) return "clean";
+    const studioSource = await this.#fetchSource(path);
+    const backup =
+      studioSource === null ? undefined : await this.#backupStudio(file, studioSource, ts);
+    if (backup === undefined) {
+      this.#log.warn(`sync: left ${path} alone: could not save the Studio version first`);
+      this.#noteConflict(file, path, ts, "pending");
+      return "held";
+    }
+    this.#noteConflict(file, path, ts, "kept-fs", backup);
+    return "saved";
   }
 
   async #statOf(rel: string): Promise<Stats | null> {

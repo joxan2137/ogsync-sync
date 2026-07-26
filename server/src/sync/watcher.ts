@@ -103,7 +103,15 @@ export class FsWatcher {
   #sweep(prime: boolean): string[] {
     const seen = new Set<string>();
     const dirs: string[] = [];
-    for (const root of this.#opts.dirs) this.#walk(root, seen, dirs, prime);
+    for (const root of this.#opts.dirs) {
+      const failed = this.#walk(root, seen, dirs, prime);
+      if (failed === null) continue;
+      // An unreadable directory looks exactly like an emptied one. Keeping
+      // #known untouched is what stops an IO error from being read as a
+      // whole-tree delete; the next sweep retries.
+      this.#log().warn(`sync: sweep aborted, cannot read ${failed === "" ? "." : failed}`);
+      return dirs;
+    }
     for (const rel of [...this.#known.keys()]) {
       if (seen.has(rel)) continue;
       this.#known.delete(rel);
@@ -115,25 +123,28 @@ export class FsWatcher {
     return dirs;
   }
 
-  #walk(rel: string, seen: Set<string>, dirs: string[], prime: boolean): void {
+  /** The directory it could not read, or null when the whole subtree was walked. */
+  #walk(rel: string, seen: Set<string>, dirs: string[], prime: boolean): string | null {
     let dirents;
     try {
       dirents = readdirSync(join(this.#opts.dir, rel), { withFileTypes: true });
     } catch {
-      return;
+      return rel;
     }
     dirs.push(rel);
     for (const dirent of dirents) {
       const child = rel === "" ? dirent.name : `${rel}/${dirent.name}`;
       if (isIgnoredFile(child)) continue;
       if (dirent.isDirectory()) {
-        this.#walk(child, seen, dirs, prime);
+        const failed = this.#walk(child, seen, dirs, prime);
+        if (failed !== null) return failed;
         continue;
       }
       if (!dirent.isFile()) continue;
       seen.add(child);
       this.#observe(child, prime);
     }
+    return null;
   }
 
   #observe(rel: string, prime: boolean): void {

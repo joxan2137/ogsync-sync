@@ -24,7 +24,8 @@ import {
 } from "../proto/types.ts";
 import { FOLDER_CLASS, FOLDER_HASH } from "./project.ts";
 import { ShadowStore } from "./shadow.ts";
-import { SyncEngine, decide, type Action } from "./engine.ts";
+import { FsWatcher, type FsEvent } from "./watcher.ts";
+import { SAFE_MODE_KEY, SyncEngine, decide, type Action } from "./engine.ts";
 
 const SHARED = "game.ReplicatedStorage.Shared";
 const PROJECT = JSON.stringify({
@@ -107,6 +108,8 @@ class FakeBridge implements Bridge {
   readonly calls: { op: OpName; args: unknown }[] = [];
   readonly studio = new Map<string, StudioInstance>();
   session: SessionInfo | null = SESSION;
+  /** Makes script.read answer like a plugin that capped its output. */
+  truncate: "flag" | "lines" | null = null;
   readonly #listeners = new Set<(ev: BridgeEvent, from: SessionInfo) => void>();
 
   put(path: string, cls: string, source: string): void {
@@ -119,6 +122,13 @@ class FakeBridge implements Bridge {
 
   countOf(op: OpName): number {
     return this.calls.filter((c) => c.op === op).length;
+  }
+
+  applied(kind: SyncChange["kind"]): SyncChange[] {
+    return this.calls
+      .filter((c) => c.op === "sync.apply")
+      .flatMap((c) => (c.args as { changes: SyncChange[] }).changes)
+      .filter((c) => c.kind === kind);
   }
 
   async call(op: OpName, args: unknown): Promise<unknown> {
@@ -135,6 +145,13 @@ class FakeBridge implements Bridge {
       const { path } = args as { path: string };
       const inst = this.studio.get(path);
       if (inst === undefined) throw new BridgeError("NOPATH", path);
+      const lines = inst.source.split("\n");
+      if (this.truncate === "flag") {
+        return { path, lines, total: lines.length, hash: inst.hash, truncated: true };
+      }
+      if (this.truncate === "lines") {
+        return { path, lines: lines.slice(0, 1), total: lines.length + 5, hash: inst.hash };
+      }
       return { path, source: inst.source, hash: inst.hash };
     }
     if (op === "sync.apply") {
@@ -224,7 +241,11 @@ interface Harness {
   read: (rel: string) => string | null;
 }
 
-function harness(files: Record<string, string>, sync?: Partial<OgsyncConfig["sync"]>): Harness {
+function harness(
+  files: Record<string, string>,
+  sync?: Partial<OgsyncConfig["sync"]>,
+  now?: () => number,
+): Harness {
   const dir = fixture({ "default.project.json": PROJECT, ...files });
   const bridge = new FakeBridge();
   const logs: string[] = [];
@@ -232,6 +253,7 @@ function harness(files: Record<string, string>, sync?: Partial<OgsyncConfig["syn
     pollMs: 40,
     coalesceMs: 10,
     bindPollMs: 60,
+    ...(now === undefined ? {} : { now }),
     logger: {
       info: (m) => logs.push(`info ${m}`),
       warn: (m) => logs.push(`warn ${m}`),
@@ -258,14 +280,16 @@ async function waitFor(check: () => boolean, label: string, ms = 4000): Promise<
   throw new Error(`timed out waiting for ${label}`);
 }
 
-function backupsIn(dir: string, stem: string): string[] {
-  return readdirSync(join(dir, "src/shared")).filter((f) =>
-    new RegExp(`^${stem}\\.conflict-\\d+\\.luau$`).test(f),
-  );
+// Backups keep the whole original name, suffix included: Hello.luau.conflict-<ts>.luau
+function backupsIn(dir: string, name: string): string[] {
+  const stem = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return readdirSync(join(dir, "src/shared"))
+    .filter((f) => new RegExp(`^${stem}\\.conflict-\\d+(?:-\\d+)?\\.luau$`).test(f))
+    .sort();
 }
 
-function backupIn(dir: string, stem: string): string | undefined {
-  return backupsIn(dir, stem)[0];
+function backupIn(dir: string, name: string): string | undefined {
+  return backupsIn(dir, name)[0];
 }
 
 function shadowOf(dir: string): Record<string, { hash: string; file: string; class: string }> {
@@ -297,9 +321,64 @@ describe("shadow store", () => {
     expect(again.findByFile("b.luau")?.path).toBe("game.B");
   });
 
-  test("corrupt shadow degrades to empty instead of throwing", async () => {
+  test("corrupt shadow is moved aside and reported, never silently emptied", async () => {
     const dir = fixture({ ".ogsync/shadow.json": "{not json" });
-    expect((await ShadowStore.load(dir)).size).toBe(0);
+    const shadow = await ShadowStore.load(dir);
+    expect(shadow.size).toBe(0);
+    expect(shadow.corrupt).not.toBeNull();
+    expect(existsSync(ShadowStore.pathOf(dir))).toBe(false);
+    const aside = readdirSync(join(dir, ".ogsync"));
+    expect(aside).toHaveLength(1);
+    expect(aside[0]).toMatch(/^shadow\.json\.corrupt-\d+$/);
+    expect(readFileSync(join(dir, ".ogsync", aside[0] as string), "utf8")).toBe("{not json");
+  });
+
+  test("an absent shadow is not corrupt", async () => {
+    expect((await ShadowStore.load(fixture({}))).corrupt).toBeNull();
+  });
+});
+
+// ------------------------------------------------------------------ fs watcher
+
+describe("fs watcher", () => {
+  function watcher(dir: string, events: FsEvent[], logs: string[]): FsWatcher {
+    return new FsWatcher({
+      dir,
+      dirs: ["src/shared"],
+      debounceMs: 0,
+      pollMs: 60_000,
+      onEvent: (ev) => events.push(ev),
+      logger: {
+        info: (m) => logs.push(`info ${m}`),
+        warn: (m) => logs.push(`warn ${m}`),
+        error: (m) => logs.push(`error ${m}`),
+      },
+    });
+  }
+
+  test("a readdir failure aborts the sweep instead of reporting every file deleted", () => {
+    const dir = fixture({ "src/shared/A.luau": "a\n", "src/shared/Nested/B.luau": "b\n" });
+    const events: FsEvent[] = [];
+    const logs: string[] = [];
+    const w = watcher(dir, events, logs);
+    w.start();
+    rmSync(join(dir, "src/shared"), { recursive: true, force: true });
+    w.sweep();
+    w.stop();
+    expect(events).toEqual([]);
+    expect(logs.some((l) => l.includes("sweep aborted"))).toBe(true);
+  });
+
+  test("a readable tree still reports a single deleted file", () => {
+    const dir = fixture({ "src/shared/A.luau": "a\n", "src/shared/B.luau": "b\n" });
+    const events: FsEvent[] = [];
+    const logs: string[] = [];
+    const w = watcher(dir, events, logs);
+    w.start();
+    rmSync(join(dir, "src/shared/B.luau"));
+    w.sweep();
+    w.stop();
+    expect(events).toEqual([{ file: "src/shared/B.luau", kind: "deleted" }]);
   });
 });
 
@@ -362,7 +441,7 @@ describe("reconcile", () => {
     await h.engine.start();
     await h.engine.drain();
     expect(h.bridge.studio.get(`${SHARED}.Hello`)?.source).toBe("fs version\n");
-    const backup = backupIn(h.dir, "Hello");
+    const backup = backupIn(h.dir, "Hello.luau");
     expect(backup).toBeDefined();
     expect(h.read(`src/shared/${backup as string}`)).toBe("studio version\n");
     const [conflict] = h.engine.status().conflicts;
@@ -379,7 +458,70 @@ describe("reconcile", () => {
     expect(h.read("src/shared/Hello.luau")).toBe("fs version\n");
     const [conflict] = h.engine.status().conflicts;
     expect(conflict?.resolution).toBe("pending");
-    expect(h.read(`src/shared/${backupIn(h.dir, "Hello") as string}`)).toBe("studio version\n");
+    expect(h.read(`src/shared/${backupIn(h.dir, "Hello.luau") as string}`)).toBe("studio version\n");
+  });
+
+  test("a truncated script.read is never written to disk or recorded", async () => {
+    for (const mode of ["flag", "lines"] as const) {
+      const h = harness({ "src/shared/Keep.luau": "return 'keep'\n" });
+      h.bridge.truncate = mode;
+      h.bridge.put(`${SHARED}.Remote`, "ModuleScript", "line1\nline2\nline3\n");
+      await h.engine.start();
+      await h.engine.drain();
+      expect(h.read("src/shared/Remote.luau")).toBeNull();
+      expect(shadowOf(h.dir)[`${SHARED}.Remote`]).toBeUndefined();
+      expect(h.logs.some((l) => l.includes("came back partial"))).toBe(true);
+    }
+  });
+
+  test("CRLF files hash like their LF form and never re-push", async () => {
+    const h = harness({ "src/shared/Hello.luau": "return 1\r\nreturn 2\r\n" });
+    await h.engine.start();
+    await h.engine.drain();
+    const lf = "return 1\nreturn 2\n";
+    expect(h.bridge.studio.get(`${SHARED}.Hello`)?.source).toBe(lf);
+    expect(shadowOf(h.dir)[`${SHARED}.Hello`]?.hash).toBe(contentHash(lf));
+    expect(h.read("src/shared/Hello.luau")).toBe("return 1\r\nreturn 2\r\n"); // user file untouched
+    const writes = h.bridge.applied("create").length + h.bridge.applied("write").length;
+    await h.engine.reconcile();
+    expect(h.bridge.applied("create").length + h.bridge.applied("write").length).toBe(writes);
+  });
+
+  test("a corrupt shadow starts safe mode: nothing is overwritten on either side", async () => {
+    const h = harness({
+      "src/shared/Hello.luau": "fs version\n",
+      ".ogsync/shadow.json": "{not json",
+    });
+    h.bridge.put(`${SHARED}.Hello`, "ModuleScript", "studio version\n");
+    await h.engine.start();
+    await h.engine.drain();
+    expect(h.read("src/shared/Hello.luau")).toBe("fs version\n");
+    expect(h.bridge.studio.get(`${SHARED}.Hello`)?.source).toBe("studio version\n");
+    const status = h.engine.status();
+    expect(status.conflicts.find((c) => c.file === SAFE_MODE_KEY)?.path).toMatch(/corrupt-\d+$/);
+    expect(status.conflicts.find((c) => c.file === "src/shared/Hello.luau")?.resolution).toBe(
+      "pending",
+    );
+    expect(h.logs.some((l) => l.includes("safe mode"))).toBe(true);
+  });
+
+  test("two files claiming one instance path are excluded and reported", async () => {
+    const h = harness({
+      "src/shared/Twin.luau": "return 'module'\n",
+      "src/shared/Twin.server.luau": "print('script')\n",
+      "src/shared/Solo.luau": "return 'solo'\n",
+    });
+    await h.engine.start();
+    await h.engine.drain();
+    expect(h.bridge.studio.has(`${SHARED}.Twin`)).toBe(false);
+    expect(h.bridge.studio.has(`${SHARED}.Solo`)).toBe(true);
+    expect(shadowOf(h.dir)[`${SHARED}.Twin`]).toBeUndefined();
+    expect(
+      h.logs.some(
+        (l) => l.includes("Twin.luau and src/shared/Twin.server.luau") && l.includes("excluding"),
+      ),
+    ).toBe(true);
+    expect(h.engine.status().conflicts.some((c) => c.path === `${SHARED}.Twin`)).toBe(true);
   });
 
   test("startup notice counts unsupported file types", async () => {
@@ -471,6 +613,77 @@ describe("studio → fs", () => {
     expect(shadowOf(h.dir)[`${SHARED}.Hello`]).toBeUndefined();
   });
 
+  test("a rename onto an existing file backs it up instead of replacing it", async () => {
+    const h = harness({
+      "src/shared/Hello.luau": "return 1\n",
+      "src/shared/Howdy.luau": "local work\n",
+    });
+    await h.engine.start();
+    await h.engine.drain();
+    h.bridge.emit({ ev: "instRenamed", path: `${SHARED}.Howdy`, oldPath: `${SHARED}.Hello` });
+    await h.engine.drain();
+    expect(h.read("src/shared/Howdy.luau")).toBe("return 1\n");
+    expect(backupsIn(h.dir, "Howdy.luau").map((f) => h.read(`src/shared/${f}`))).toEqual([
+      "local work\n",
+    ]);
+    const conflict = h.engine.status().conflicts.find((c) => c.file === "src/shared/Howdy.luau");
+    const [saved] = backupsIn(h.dir, "Howdy.luau");
+    expect(conflict?.backupFile).toBe(`src/shared/${saved as string}`);
+  });
+
+  test("backups keep the full suffix and never overwrite each other", async () => {
+    const ts = 1_700_000_000_000;
+    const h = harness(
+      { "src/shared/Main.server.luau": "fs work\n" },
+      { conflict: "manual" },
+      () => ts,
+    );
+    h.bridge.put(`${SHARED}.Main`, "Script", "studio one\n");
+    await h.engine.start();
+    await h.engine.drain();
+    h.bridge.emit({
+      ev: "scriptChanged",
+      path: `${SHARED}.Main`,
+      source: "studio two\n",
+      hash: contentHash("studio two\n"),
+      ts,
+    });
+    await h.engine.drain();
+    expect(backupsIn(h.dir, "Main.server.luau")).toEqual([
+      `Main.server.luau.conflict-${ts}-2.luau`,
+      `Main.server.luau.conflict-${ts}.luau`,
+    ]);
+    const kept = backupsIn(h.dir, "Main.server.luau").map((f) => h.read(`src/shared/${f}`));
+    expect(kept.sort()).toEqual(["studio one\n", "studio two\n"]);
+    expect(backupsIn(h.dir, "Main")).toEqual([]); // stem alone would collide with Main.luau
+    expect(h.read("src/shared/Main.server.luau")).toBe("fs work\n");
+  });
+
+  test("prefer-newest compares receive time, not the Studio wall clock", async () => {
+    const h = harness(
+      { "src/shared/Hello.luau": "return 1\n" },
+      { conflict: "prefer-newest" },
+      () => Date.now() - 60_000,
+    );
+    await h.engine.start();
+    await h.engine.drain();
+    h.engine.pause();
+    writeFileSync(h.file("src/shared/Hello.luau"), "fs newest\n", "utf8");
+    h.bridge.put(`${SHARED}.Hello`, "ModuleScript", "studio drifted\n");
+    h.bridge.emit({
+      ev: "scriptChanged",
+      path: `${SHARED}.Hello`,
+      source: "studio drifted\n",
+      hash: contentHash("studio drifted\n"),
+      ts: Date.now() + 3_600_000, // Studio clock an hour ahead
+    });
+    h.engine.resume();
+    await h.engine.drain();
+    expect(h.read("src/shared/Hello.luau")).toBe("fs newest\n");
+    expect(h.bridge.studio.get(`${SHARED}.Hello`)?.source).toBe("fs newest\n");
+    expect(h.engine.status().conflicts[0]?.resolution).toBe("kept-fs");
+  });
+
   test("instRemoved never deletes unsynced local work", async () => {
     const h = harness({ "src/shared/Hello.luau": "return 1\n" });
     await h.engine.start();
@@ -514,10 +727,27 @@ describe("fs → studio", () => {
       () => h.bridge.studio.get(`${SHARED}.Hello`)?.source === "fs newer\n",
       "forced apply after conflict",
     );
-    const backup = backupIn(h.dir, "Hello");
+    const backup = backupIn(h.dir, "Hello.luau");
     expect(backup).toBeDefined();
     expect(h.read(`src/shared/${backup as string}`)).toBe("studio drifted\n");
     expect(h.engine.status().conflicts[0]?.resolution).toBe("kept-fs");
+  });
+
+  test("a file that is back on disk before the flush is never deleted in Studio", async () => {
+    // Long fs debounce keeps the re-create from replacing the queued delete,
+    // so the flush really does see kind "deleted" for a file that exists.
+    const h = harness({ "src/shared/Hello.luau": "return 1\n" }, { debounce_fs_ms: 3000 });
+    await h.engine.start();
+    await h.engine.drain();
+    h.engine.pause();
+    rmSync(h.file("src/shared/Hello.luau"));
+    await waitFor(() => h.engine.status().pending > 0, "delete queued");
+    writeFileSync(h.file("src/shared/Hello.luau"), "saved again\n", "utf8");
+    h.engine.resume();
+    await h.engine.drain();
+    expect(h.bridge.applied("delete")).toEqual([]);
+    expect(h.bridge.studio.get(`${SHARED}.Hello`)?.source).toBe("saved again\n");
+    expect(h.logs.some((l) => l.includes("is back on disk"))).toBe(true);
   });
 
   test("deleting a file deletes the instance", async () => {
@@ -586,6 +816,44 @@ describe("control surface", () => {
     expect(report).toContain("studio-only kept");
   });
 
+  test("fullPush backs up diverged Studio content before overwriting it", async () => {
+    const h = harness({ "src/shared/Hello.luau": "fs wins\n" }, { conflict: "manual" });
+    h.bridge.put(SHARED, FOLDER_CLASS, "");
+    h.bridge.put(`${SHARED}.Hello`, "ModuleScript", "studio work\n");
+    h.bridge.put(`${SHARED}.Gone`, "ModuleScript", "studio drifted\n");
+    const shadow = await ShadowStore.load(h.dir);
+    shadow.set(`${SHARED}.Gone`, {
+      hash: contentHash("in sync once\n"),
+      file: "src/shared/Gone.luau",
+      class: "ModuleScript",
+    });
+    await shadow.save();
+    await h.engine.start();
+    const report = await h.engine.fullPush();
+    expect(h.bridge.studio.get(`${SHARED}.Hello`)?.source).toBe("fs wins\n");
+    expect(h.bridge.studio.has(`${SHARED}.Gone`)).toBe(false);
+    const saved = [...backupsIn(h.dir, "Hello.luau"), ...backupsIn(h.dir, "Gone.luau")].map((f) =>
+      h.read(`src/shared/${f}`),
+    );
+    expect(new Set(saved)).toEqual(new Set(["studio drifted\n", "studio work\n"]));
+    expect(report).toContain("2 studio version(s) backed up");
+    expect(report).toContain("1 written, 1 deleted");
+  });
+
+  test("fullPush carries the snapshot hash so a mid-push Studio edit is caught", async () => {
+    const h = harness({ "src/shared/Hello.luau": "fs wins\n" }, { conflict: "manual" });
+    h.bridge.put(SHARED, FOLDER_CLASS, "");
+    await h.engine.start();
+    await h.engine.drain();
+    h.bridge.put(`${SHARED}.Hello`, "ModuleScript", "typed while pushing\n");
+    await h.engine.fullPush();
+    expect(h.bridge.applied("write").some((c) => c.baseHash !== undefined)).toBe(true);
+    expect(h.bridge.studio.get(`${SHARED}.Hello`)?.source).toBe("fs wins\n");
+    expect(backupsIn(h.dir, "Hello.luau").map((f) => h.read(`src/shared/${f}`))).toContain(
+      "typed while pushing\n",
+    );
+  });
+
   test("fullPull overwrites disk from Studio and backs up differences", async () => {
     const h = harness({ "src/shared/Hello.luau": "fs loses\n" }, { conflict: "manual" });
     h.bridge.put(SHARED, FOLDER_CLASS, "");
@@ -595,7 +863,7 @@ describe("control surface", () => {
     const report = await h.engine.fullPull();
     expect(h.read("src/shared/Hello.luau")).toBe("studio wins\n");
     expect(h.read("src/shared/Extra.luau")).toBe("brand new\n");
-    expect(backupsIn(h.dir, "Hello").map((f) => h.read(`src/shared/${f}`))).toContain("fs loses\n");
+    expect(backupsIn(h.dir, "Hello.luau").map((f) => h.read(`src/shared/${f}`))).toContain("fs loses\n");
     expect(report).toContain("1 overwritten (1 backed up)");
   });
 

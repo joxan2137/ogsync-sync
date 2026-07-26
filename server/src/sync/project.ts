@@ -4,7 +4,7 @@
 
 import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
-import { contentHash } from "../proto/types.ts";
+import { contentHash, normalizeSource } from "../proto/types.ts";
 
 export type NodeKind = "server" | "client" | "module" | "plugin" | "folder";
 
@@ -60,7 +60,9 @@ const INIT_BASENAMES: readonly string[] = [
 ];
 
 const PLAIN_SEGMENT = /^[A-Za-z_][A-Za-z0-9_]*$/;
-const CONFLICT_BACKUP = /\.conflict-\d+\.luau$/;
+const CONFLICT_BACKUP = /\.conflict-\d+(?:-\d+)?\.luau$/;
+const CONTROL_CHAR = /[\u0000-\u001f\u007f]/;
+const QUOTE_OR_BACKSLASH = /["\\]/g;
 
 export function isSyncableClass(cls: string): boolean {
   return cls === FOLDER_CLASS || SCRIPT_CLASSES.has(cls);
@@ -77,8 +79,22 @@ export function fileSuffixFor(cls: string, kind?: NodeKind): string {
   return ".luau";
 }
 
+/**
+ * Bracket form of one segment. The plugin's Path.luau unescapes `\"` and `\\`
+ * and nothing else — a `\n` or `\uXXXX` escape would come back as the literal
+ * letters, so the escape set here must stay exactly those two characters.
+ */
+export function quoteSegment(name: string): string {
+  return `"${name.replace(QUOTE_OR_BACKSLASH, "\\$&")}"`;
+}
+
+/** Control characters survive neither the path grammar nor line-based output. */
+export function isSyncableName(name: string): boolean {
+  return name !== "" && !CONTROL_CHAR.test(name);
+}
+
 export function joinInst(base: string, name: string): string {
-  return PLAIN_SEGMENT.test(name) ? `${base}.${name}` : `${base}[${JSON.stringify(name)}]`;
+  return PLAIN_SEGMENT.test(name) ? `${base}.${name}` : `${base}[${quoteSegment(name)}]`;
 }
 
 export function buildInst(segments: readonly string[]): string {
@@ -190,6 +206,8 @@ function relChild(dir: string, name: string): string {
 export class ProjectMap {
   readonly #mounts: Mount[] = [];
   readonly #ignored = new Map<string, number>();
+  readonly #duplicates = new Map<string, string[]>();
+  readonly #unsyncable = new Map<string, string>();
 
   private constructor(
     readonly dir: string,
@@ -332,7 +350,7 @@ export class ProjectMap {
   /** Project-relative file (or directory) → mapped instance, or null when unsupported. */
   fileToInst(relPath: string): MappedNode | null {
     const rel = toPosix(relPath);
-    if (rel === "" || isIgnoredFile(rel)) return null;
+    if (rel === "" || isIgnoredFile(rel) || !this.#namesSyncable(rel)) return null;
     const mount = this.#mountForFile(rel);
     if (mount === null) return null;
 
@@ -375,11 +393,20 @@ export class ProjectMap {
     return { path: inst, class: cls, kind: cls === conv.class ? conv.kind : kindOfClass(cls) };
   }
 
+  #namesSyncable(rel: string): boolean {
+    const bad = rel.split("/").find((seg) => !isSyncableName(seg));
+    if (bad === undefined) return true;
+    this.#unsyncable.set(rel, bad);
+    return false;
+  }
+
   /** Full scan of every mapped root. Refreshes ignoredCounts(). */
   scanFs(): Map<string, FsEntry> {
     const out = new Map<string, FsEntry>();
     const visited = new Set<string>();
     this.#ignored.clear();
+    this.#duplicates.clear();
+    this.#unsyncable.clear();
     for (const mount of this.#mounts) {
       const abs = join(this.dir, mount.path);
       if (!existsSync(abs)) continue;
@@ -395,6 +422,16 @@ export class ProjectMap {
 
   ignoredCounts(): ReadonlyMap<string, number> {
     return this.#ignored;
+  }
+
+  /** Instance paths two or more files claim; excluded from sync, never guessed. */
+  duplicatePaths(): ReadonlyMap<string, string[]> {
+    return this.#duplicates;
+  }
+
+  /** Files whose name cannot round-trip through the path grammar → offending segment. */
+  unsyncableFiles(): ReadonlyMap<string, string> {
+    return this.#unsyncable;
   }
 
   #scanDir(out: Map<string, FsEntry>, visited: Set<string>, dirRel: string): void {
@@ -416,7 +453,7 @@ export class ProjectMap {
     if (visited.has(rel)) return;
     visited.add(rel);
     const mapped = this.fileToInst(rel);
-    if (mapped === null) return;
+    if (mapped === null || !this.#claim(out, mapped.path, rel)) return;
     out.set(mapped.path, { file: rel, class: FOLDER_CLASS, source: "", hash: FOLDER_HASH });
   }
 
@@ -428,8 +465,30 @@ export class ProjectMap {
       this.#countIgnored(rel);
       return;
     }
-    const source = readFileSync(join(this.dir, rel), "utf8");
+    if (!this.#claim(out, mapped.path, rel)) return;
+    const source = normalizeSource(readFileSync(join(this.dir, rel), "utf8"));
     out.set(mapped.path, { file: rel, class: mapped.class, source, hash: contentHash(source) });
+  }
+
+  /**
+   * True when `rel` may own `inst`. Two files claiming one instance path is
+   * ambiguous in both directions, so the path leaves the scan entirely instead
+   * of silently resolving to whichever file the walk reached last.
+   */
+  #claim(out: Map<string, FsEntry>, inst: string, rel: string): boolean {
+    const clash = this.#duplicates.get(inst);
+    if (clash !== undefined) {
+      if (!clash.includes(rel)) clash.push(rel);
+      return false;
+    }
+    const existing = out.get(inst);
+    if (existing === undefined) return true;
+    // A directory entering as a Folder and its init.* child promoting it to a
+    // script are the same node by design, not a collision.
+    if (existing.class === FOLDER_CLASS && rel.startsWith(`${existing.file}/`)) return true;
+    out.delete(inst);
+    this.#duplicates.set(inst, [existing.file, rel]);
+    return false;
   }
 
   #countIgnored(rel: string): void {

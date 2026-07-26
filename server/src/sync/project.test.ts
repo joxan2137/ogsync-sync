@@ -8,9 +8,11 @@ import {
   FOLDER_HASH,
   buildInst,
   isIgnoredFile,
+  isSyncableName,
   isUnder,
   joinInst,
   loadProject,
+  quoteSegment,
   splitInst,
 } from "./project.ts";
 
@@ -72,9 +74,21 @@ describe("path grammar", () => {
   });
 
   test("split/build round-trips bracketed segments", () => {
-    const segments = ["game", "Workspace", "My.Part", 'Quote"Name', "Plain"];
+    const segments = ["game", "Workspace", "My.Part", 'Quote"Name', "Back\\slash", "Plain"];
     const path = buildInst(segments);
     expect(splitInst(path)).toEqual(segments);
+  });
+
+  test("quoting escapes only what the plugin can unescape", () => {
+    expect(quoteSegment('Say"Hi')).toBe('"Say\\"Hi"');
+    expect(quoteSegment("Back\\slash")).toBe('"Back\\\\slash"');
+    // JSON.stringify would emit \t / \u0009 here; Path.luau reads those as
+    // literal letters, so such names are rejected instead of escaped.
+    expect(joinInst("game.X", "Tab\tName")).toBe('game.X["Tab\tName"]');
+    expect(isSyncableName("Plain")).toBe(true);
+    expect(isSyncableName("Tab\tName")).toBe(false);
+    expect(isSyncableName("Line\nBreak")).toBe(false);
+    expect(isSyncableName("")).toBe(false);
   });
 
   test("isUnder respects segment boundaries", () => {
@@ -229,6 +243,14 @@ describe("scanFs", () => {
     }
   });
 
+  test("a file whose name cannot round-trip is rejected, not escaped", () => {
+    const bell = "src/shared/Bad\u0007Name.luau";
+    const nested = "src/shared/Ring\u0001/Deep.luau";
+    expect(project.fileToInst(bell)).toBeNull();
+    expect(project.fileToInst(nested)).toBeNull();
+    expect([...project.unsyncableFiles().keys()].sort()).toEqual([bell, nested].sort());
+  });
+
   test("unsupported file types are counted, not synced", () => {
     expect([...scan.keys()].some((p) => p.endsWith("notes"))).toBe(false);
     expect(Object.fromEntries(project.ignoredCounts())).toEqual({
@@ -258,6 +280,60 @@ describe("edge cases", () => {
       hash: contentHash("return 'module'\n"),
     });
     expect(project.fileToInst("src/Both/init.server.luau")).toBeNull();
+  });
+
+  test("two files claiming one instance path drop it from the scan", () => {
+    const dir = fixture({
+      "default.project.json": JSON.stringify({
+        name: "T",
+        tree: { ReplicatedStorage: { Shared: { $path: "src" } } },
+      }),
+      "src/Twin.luau": "return 'module'\n",
+      "src/Twin.server.luau": "print('script')\n",
+      "src/Solo.luau": "return 'solo'\n",
+    });
+    const project = loadProject(dir, "default.project.json");
+    const scan = project.scanFs();
+    expect(scan.has("game.ReplicatedStorage.Shared.Twin")).toBe(false);
+    expect(scan.has("game.ReplicatedStorage.Shared.Solo")).toBe(true);
+    expect(project.duplicatePaths().get("game.ReplicatedStorage.Shared.Twin")?.sort()).toEqual([
+      "src/Twin.luau",
+      "src/Twin.server.luau",
+    ]);
+  });
+
+  test("a file and a directory of the same name collide; init.* promotion does not", () => {
+    const dir = fixture({
+      "default.project.json": JSON.stringify({
+        name: "T",
+        tree: { ReplicatedStorage: { Shared: { $path: "src" } } },
+      }),
+      "src/Clash.luau": "return 1\n",
+      "src/Clash/Inner.luau": "return 2\n",
+      "src/Fine/init.luau": "return 3\n",
+    });
+    const project = loadProject(dir, "default.project.json");
+    const scan = project.scanFs();
+    expect(scan.has("game.ReplicatedStorage.Shared.Clash")).toBe(false);
+    const clash = project.duplicatePaths().get("game.ReplicatedStorage.Shared.Clash") ?? [];
+    expect([...clash].sort()).toEqual(["src/Clash", "src/Clash.luau"]);
+    expect(scan.get("game.ReplicatedStorage.Shared.Fine")?.file).toBe("src/Fine/init.luau");
+    expect(scan.has("game.ReplicatedStorage.Shared.Clash.Inner")).toBe(true);
+  });
+
+  test("CRLF sources are hashed as their LF form", () => {
+    const dir = fixture({
+      "default.project.json": JSON.stringify({
+        name: "T",
+        tree: { ReplicatedStorage: { Shared: { $path: "src" } } },
+      }),
+      "src/Windows.luau": "local a = 1\r\nreturn a\r\n",
+    });
+    const entry = loadProject(dir, "default.project.json")
+      .scanFs()
+      .get("game.ReplicatedStorage.Shared.Windows");
+    expect(entry?.source).toBe("local a = 1\nreturn a\n");
+    expect(entry?.hash).toBe(contentHash("local a = 1\nreturn a\n"));
   });
 
   test("a nested default.project.json extends the tree", () => {
