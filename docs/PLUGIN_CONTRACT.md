@@ -8,7 +8,8 @@ All modules `--!strict`. No external packages. JSON via `HttpService:JSONEncode/
 ```
 plugin/src/
   init.server.luau        core  entry: role detect, toolbar, wiring, stop-monitor
-  Net.luau                core  handshake/pull/push loops, backoff, queues
+  Net.luau                core  handshake/pull/push loops, port discovery, backoff, queues
+  Lifecycle.luau          core  playtest state heartbeat (edit + play-server roles)
   Dispatcher.luau         core  op registry; requires all Ops/* and Sync/Ops
   Broker.luau             core  RemoteFunction broker (play server⇄clients)
   Sync/Watcher.luau       core  studio-side change detection → events
@@ -17,10 +18,14 @@ plugin/src/
   Util/Path.luau          core  dot-path grammar resolve/serialize
   Util/Serde.luau         core  property value encode/decode
   Util/Output.luau        core  size-capped list/table builders
+  Util/Ports.luau         core  daemon candidate ports (mirror of CANDIDATE_PORTS)
+  Util/JobLog.luau        core  seen job ids, so redelivered jobs never run twice
+  Util/PlayState.luau     core  playtest intent + StudioTestService activity, state derivation
+  Util/ScriptHashes.luau  core  chunked path→hash map of every script (stale-code check)
   Ops/Inst.luau           ops   inst.get/set/create/delete/duplicate/find/tree
   Ops/Script.luau         ops   script.read/edit/grep
   Ops/Run.luau            ops   run.exec (edit ctx direct; server/client via daemon routing)
-  Ops/Play.luau           ops   play.start/stop/status
+  Ops/Play.luau           core  play.start/stop/status/hashes
   Ops/Log.luau            ops   log.tail + log event forwarding
   Ops/Shot.luau           ops   shot.capture
   Ops/Prof.luau           ops   prof.micro/script/memory
@@ -29,6 +34,7 @@ plugin/src/
   Ops/Rbxm.luau           ops   rbxm.export/import (base64 payloads)
   Ops/Hist.luau           ops   hist.op (undo/redo/waypoint)
   Ops/Sel.luau            ops   sel.get + selection events
+  Ops/Wait.luau           core  wait.check (one non-yielding probe per call)
 ```
 
 "core" = plugin-core agent; "ops" = ops agent. Ops modules must not require
@@ -58,9 +64,22 @@ Dispatcher.dispatch(job): JobResult
 -- Every Ops/X.luau returns `function(register) ... end` and registers its ops.
 
 -- Net.luau
-Net.start(config: {baseUrl: string, session: string, role: string})
+Net.start(config: {port: number, session: string, role: string})  -- port = preferred, see Util/Ports
+Net.stop()                           -- pushes {ev:"goodbye"} first when accepted
 Net.pushEvent(ev: table)             -- queued, flushed with next push (≤300 ms)
 Net.pushPartial(jobId: string, data: any)
+Net.setConnectedHook(fn: (() -> ())?)  -- called after every accepted handshake
+
+-- Lifecycle.luau
+Lifecycle.start(config: {role: string, pushEvent: (ev) -> ()}): () -> ()  -- returns stop
+Lifecycle.connected()                -- report state now (fresh daemon state)
+
+-- Util/PlayState.luau
+PlayState.setIntent("idle"|"starting"|"stopping")
+PlayState.setTestActive(active: boolean)   -- a StudioTestService play test is running
+PlayState.derive(running, active, intent): {state, mode?}   -- pure
+PlayState.snapshot(running: boolean): {state, mode?}
+PlayState.onChange(fn): () -> ()
 ```
 
 ## Behavior requirements
@@ -77,14 +96,32 @@ Net.pushPartial(jobId: string, data: any)
   shared across DataModels of one Studio); on change to an unseen value call
   `RunService:Stop()`. This is the fallback stop path that works even if the
   play session's Net loop is wedged.
-- **Ops/Play**: `play.start` (edit role): `mode="server"` →
-  `RunService:Run()`. `mode="solo"` → attempt play-solo via available
-  plugin-security APIs (pcall chain; if only run-mode is possible, start that
-  and mark result `{started: "run", requested: "solo"}` so the daemon reports
-  the degradation honestly). `play.stop`: primary path — daemon routes the op
-  to the play-server session which calls `RunService:Stop()`; secondary —
-  daemon also sends `play.stopSignal` to the edit session, which writes
+- **Ops/Play**: idempotent. `play.start` (edit role) answers `{already: true}`
+  when a test is already running. `mode="server"` → `RunService:Run()`.
+  `mode="solo"` → `StudioTestService:ExecutePlayModeAsync` in its own thread
+  (marks `PlayState.setTestActive` until it returns; a call that fails within
+  0.5 s counts as unsupported), then the legacy plugin-security pcall chain,
+  then run mode marked `{started: "run", requested: "solo"}` so the daemon
+  reports the degradation honestly. `play.stop` answers `{stopped: false}`
+  when nothing runs; otherwise `StudioTestService:EndTest`, else
+  `RunService:Stop()`. Primary path — daemon routes the op to the play-server
+  session; secondary — `play.stopSignal` to the edit session, which writes
   `plugin:SetSetting("ogsync_stop_token", GUID)` for the monitor above.
+  `play.hashes` → `ScriptHashes.collect(game)`.
+- **Transport (Net)**: never pinned to a port. A handshake that cannot connect
+  scans `Ports.order(lastGood)` with `GET /id` and follows the daemon; a pull
+  that cannot connect, or a pull/push answered 400/404/409, falls back to the
+  handshake (same session id, so the daemon re-adopts the peer). Jobs pass
+  through `JobLog`: an id already running or done is skipped, so jobs the
+  daemon redelivers after a reconnect never run twice.
+- **Lifecycle**: edit and play-server roles push `{ev: "playtestState",
+  state, mode?, players?, hb: true}` within 1 s of a change and every 5 s
+  regardless; edit state is `PlayState.snapshot(RunService:IsRunning())`, the
+  play server always reports `running` with its player count. The daemon reads
+  a missing heartbeat as `unknown`.
+- **Frame budget**: work that can exceed a few seconds in one frame trips
+  Studio's "plugin is not responding" — yield between batches (`task.wait()`),
+  as `ScriptHashes.collect` does every 100 scripts / 256 KB.
 - **Echo suppression** (Applier): keep `lastApplied[path] = hash` — Watcher
   drops a scriptChanged whose new content hash equals `lastApplied[path]`
   (then clears the entry). Applier uses
@@ -130,7 +167,8 @@ Sections top→bottom:
    `updatePlugin`).
 2. **Connect controls** — Connect/Disconnect button (drives Net start/stop +
    persists `ogsync_enabled`); port TextBox (persists `ogsync_port`, default
-   3667, reconnects on commit).
+   3667, reconnects on commit) — the preferred port; Net still scans the
+   candidate list when it stops answering and shows the port it found.
 3. **Sync row** — `Sync: on (N pending)` / `paused` / `off`; Pause/Resume
    button (sends event `{ev:"syncToggle", paused}` — daemon honors via
    SyncControl).

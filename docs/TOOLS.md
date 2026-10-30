@@ -9,11 +9,21 @@ Conventions used by every tool:
 - **Output** — plain text, compact. Trees are 2-space indented. Tabular data is
   one line per row: `path<TAB>field=value ...`. Truncated responses end with
   `…more: pass cursor=N`. Errors: `ERR <code>: <message>` (codes: NOPATH,
-  NOPLUGIN, TIMEOUT, BADARG, STUDIO).
+  NOPLUGIN, TIMEOUT, BADARG, STUDIO, TARGET, THROTTLED, LEASE, VERSION).
 - **Property values** — Rojo-style JSON: `Vector3 [x,y,z]`, `Color3 [r,g,b]`,
   `CFrame [12 numbers]`, `UDim2 [[sx,ox],[sy,oy]]`, enums as `"Enum.Material.Neon"`
   or short `"Neon"` on input, instance refs as dot-paths.
 - All tools accept `timeout_ms` (default 15000; playtest/profile ops 60000).
+- All tools accept `target`: `<place>[:<role>]`, place = an `[aliases]` name
+  from ogsync.toml, a place key, placeId or place name; role = `edit`,
+  `server`, `client` or `client-N`. Default: `bind.target_place` from the
+  ogsync.toml in the calling session's directory. With several places
+  connected and no target, or a target matching several, the tool answers
+  `ERR TARGET` listing the candidates; it never picks one.
+- Tools run inside the machine-wide daemon; `ogsync serve` (MCP) and `ogsync
+  call <tool> '<json>'` (shell) are both thin clients of it, so every agent
+  sees the same places, queue and leases. Ops to one place run one at a time,
+  round-robin across sessions.
 
 ## run
 Execute Luau. `code` (string, required), `context` (`edit`|`server`|`client`,
@@ -79,11 +89,28 @@ Covers smart/mass duplicate. Returns created paths compacted.
 Covers material search via `class=MaterialVariant` / prop queries.
 
 ## playtest
-`action`: `start` (`mode`=`solo`|`server`), `stop`, `status`. Status reports
-mode, uptime and player list. Multi-client team test is not launchable from
-plugin APIs, so there is no `players` parameter; `solo` degrades to `server`
-(run mode) when Studio refuses play-solo, and the result says which started.
-Code inside a live playtest runs via `run` with `context=server|client`.
+`action`: `start` (`mode`=`solo`|`server`), `stop` (`force?`), `status`.
+State comes from the daemon's plugin-reported state machine
+(`idle|starting|running|stopping|unknown`), never from guessing at which
+peers are registered; `status` costs no Studio round trip. Output:
+`state=… mode= owner= started_by= for_s= players= heartbeat_ms=`, plus
+`STALE CODE: N changed, M missing …` when the running test loaded scripts
+that differ from the edit DataModel, and `WARNING: …` (e.g. "Load User
+Plugins in Test Mode" is probably off, a start that never came up, an
+auto-end).
+- `start` records the calling session as lease owner and waits up to 15 s for
+  the plugin to confirm `running`; it says "not confirmed yet" otherwise.
+  Starting again as the owner answers `already running (yours)`; anyone else
+  gets `ERR LEASE`. `solo` uses StudioTestService when available, degrades to
+  `server` (run mode) when Studio refuses play-solo, and the result says which.
+- `stop` refuses (`ERR LEASE`) a playtest another session owns, one the user
+  started in Studio, or one whose state is `unknown`, unless `force=true`.
+  Stopping an idle place answers `playtest not running`.
+- Limits from `[playtest]` in ogsync.toml: `max_clients` (default 2),
+  `auto_end_s` (default 1800, agent-started tests only), `plugin_grace_s`
+  (default 10). Multi-client team test is not launchable from plugin APIs.
+Code inside a live playtest runs via `run` with `context=server|client`, or
+any tool with `target=<place>:server|client-N`.
 
 ## logs
 `context` (`edit`|`server`|`client`|`all`, default `all`), `level`
@@ -94,7 +121,19 @@ Served from the daemon's own buffer, fed by plugin log events from every
 connected session, so output survives a playtest ending and costs no Studio
 round trip. The first call for a context also backfills the plugin's ring
 buffer. A solo playtest shares one DataModel, so its client output arrives
-tagged `server`.
+tagged `server`. An identical call repeated within 1 s answers `ERR THROTTLED:
+… retry after N ms`; block on `wait for=log` instead of polling.
+
+## wait
+Long-poll until a condition holds, instead of retrying a tool. `for`:
+- `log` — `pattern` (regex, required), `context?`, `since?` (logs cursor;
+  default: only lines after the call). Returns the matching lines + cursor.
+- `playtest` — `state` (`idle|starting|running|stopping|unknown`).
+- `attribute` — `path`, `name`, `value?` (omitted: until the attribute exists).
+- `instance` — `path` (until it exists).
+`timeoutMs` (default 30000, max 300000). Log and playtest waits read daemon
+state; attribute/instance re-check through the plugin every 500 ms via the
+fair queue. Returns `wait ok: …`, or `ERR TIMEOUT: …` naming the last state seen.
 
 ## screenshot
 `target` (`viewport` default), `camera_focus?` (path — frame instance before
