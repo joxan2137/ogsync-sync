@@ -42,7 +42,7 @@ Use `wait` for: a log line (`for: "log"`, regex `pattern`), a playtest state, an
 
 ## Changing the place
 
-- Each write call (`set`, `create`, `delete`, `duplicate`, `transform`, `edit`) is one undo step, and a call that fails rolls back.
+- Each write call (`set`, `create`, `delete`, `duplicate`, `transform`) is one undo step, and a call that fails rolls back. Script text is not: Studio's undo never records `Source`, so `read` a script before changing it if you may need to put it back.
 - Move or rotate several models with `transform`; it plans every target from the original pivots first. Run it with `dry_run` first on anything large.
 - The place autosaves through Team Create. Never tell the user a place is unsaved.
 

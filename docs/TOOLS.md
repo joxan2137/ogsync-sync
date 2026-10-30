@@ -30,6 +30,9 @@ Conventions used by every tool:
   `ChangeHistoryService` recording. A call that throws part-way cancels its
   recording, which rolls the partial write back. Outside edit mode (or while
   another plugin holds a recording) the write still happens, ungrouped.
+  Script text is the exception: Studio's undo history never records `Source`
+  (checked live), so `history undo` cannot revert `edit`, `grep replace` or a
+  `set` of `Source`; to revert, `read` first and write the old text back.
 - **Visual pre-flight (Windows)** — `screenshot` and the key/click/move/scroll
   actions of `input` first check the bound place's Studio window. They refuse
   fast with the reason when it cannot paint: session locked, window minimized,
@@ -98,11 +101,9 @@ the change (`verified(editor)` when the script was open in a Script Editor tab).
 All text (`old`, `new`, `source`) is LF-normalized and sent as base64 of its
 UTF-8 bytes, so NULs, lone CRs and long brackets arrive intact; a source over
 64 KiB of base64 is staged in chunks first, so there is no size ceiling. The
-plugin checks the decoded text against the daemon's hash, writes `Source`
-directly (undoable with `history undo`) or, when the script is open in an
-editor tab, through `ScriptEditorService:UpdateSourceAsync` (which merges into
-the document instead of being overridden by it; that edit is undone in the
-editor tab, not by `history`), then reads the result back —
+plugin checks the decoded text against the daemon's hash, writes through
+`ScriptEditorService:UpdateSourceAsync` (which merges into an open editor
+document instead of being overridden by it), then reads the result back —
 `GetEditorSource` when a document is open, `Source` otherwise — and fails if
 its hash differs.
 

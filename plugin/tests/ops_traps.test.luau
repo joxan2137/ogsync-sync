@@ -113,7 +113,7 @@ local function testSourceWrite()
 	local editor = env.game:GetService("ScriptEditorService")
 	rawset(editor, "UpdateSourceAsync", function() end)
 	local stuck = errorOf(function()
-		Source.write(open, "never lands\n")
+		Source.write(closed, "never lands\n")
 	end)
 	check("a write that did not stick is reported", stuck ~= nil and string.find(stuck, "did not stick", 1, true) ~= nil, stuck)
 end

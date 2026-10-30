@@ -173,8 +173,8 @@ PlayState.onChange(fn): () -> ()
   prints from modules it requires.
 - **Write ops** run inside `Util/Recording.run` (one undo step; Cancel on
   throw). Script text goes through `Util/Source`: `take` (decode + hash check),
-  `write` (`Source =` inside the recording, or `UpdateSourceAsync` when an
-  editor document is open, then read back via `GetEditorSource` when a
+  `write` (`UpdateSourceAsync`; ChangeHistoryService never records script
+  text, so this is not undoable; then read back via `GetEditorSource` when a
   document is open, else `Source`, and compare hashes).
 - **shot.capture**: try `CaptureService:CaptureScreenshot` → contentId →
   `AssetService:CreateEditableImageAsync` → `ReadPixels` → return

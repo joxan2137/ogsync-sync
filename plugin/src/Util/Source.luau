@@ -180,19 +180,15 @@ local function editorText(inst: Instance): string?
 	return if viaDocument and type(documentText) == "string" then documentText else nil
 end
 
--- An open editor document overrides .Source, so it gets UpdateSourceAsync, whose
--- edits live on the editor's own undo stack. Without one, .Source is set
--- directly so the surrounding ChangeHistory recording can undo it.
+-- UpdateSourceAsync merges into an open editor document instead of being
+-- overridden by it; the read-back then proves the editor holds what we wrote.
+-- ChangeHistoryService never records script text, so no path here is undoable.
 function Source.write(inst: Instance, text: string, hash: string?): WriteResult
 	local expected = hash or Hash.content(text)
 	local ok, err = pcall(function()
-		if editorText(inst) ~= nil then
-			ScriptEditorService:UpdateSourceAsync(inst, function()
-				return text
-			end)
-		else
-			(inst :: any).Source = text
-		end
+		ScriptEditorService:UpdateSourceAsync(inst, function()
+			return text
+		end)
 	end)
 	if not ok then
 		error("cannot write source of " .. Path.of(inst) .. ": " .. tostring(err), 0)
