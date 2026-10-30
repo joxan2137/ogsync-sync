@@ -11,8 +11,11 @@ import {
   type PullResponse,
   type PushRequest,
   type SessionInfo,
+  type StateResponse,
 } from "../proto/types.ts";
-import { Hub, isLoopbackHost, type HealthResponse } from "./hub.ts";
+import { runAs, type Caller } from "./caller.ts";
+import { Hub, isLoopbackHost, type HealthResponse, type IdResponse } from "./hub.ts";
+import { parseTarget } from "./targets.ts";
 
 const VERSION = "9.9.9-test";
 const LONG_POLL_MS = 150;
@@ -95,25 +98,41 @@ test("handshake binds a session whose place matches target_place", async () => {
   expect(hub.bound()?.session).toBe("s-edit");
 });
 
-test("handshake refuses a place that does not match target_place", async () => {
-  const res = await handshake({ session: "s-other", placeName: "SomeOtherPlace" });
-  expect(res.accepted).toBe(false);
-  expect(res.reason).toContain("target_place");
-  expect(hub.sessions()).toHaveLength(0);
+test("handshake accepts every place; the default target still picks only target_place", async () => {
+  await handshake();
+  const res = await handshake({ session: "s-other", placeName: "SomeOtherPlace", placeId: 7 });
+  expect(res.accepted).toBe(true);
+  expect(res.placeKey).toBe("7");
+  expect(hub.sessions()).toHaveLength(2);
+  expect(hub.bound()?.session).toBe("s-edit");
 });
 
-test("handshake refuses a second session for the same place and role", async () => {
-  expect((await handshake()).accepted).toBe(true);
+test("a second Studio on the same place gets its own key and makes the id ambiguous", async () => {
+  expect((await handshake()).placeKey).toBe("42");
   const second = await handshake({ session: "s-duplicate" });
-  expect(second.accepted).toBe(false);
-  expect(second.reason).toContain("already bound");
-  expect(hub.sessions().map((info) => info.session)).toEqual(["s-edit"]);
+  expect(second.accepted).toBe(true);
+  expect(second.placeKey).toBe("42~2");
+  const ambiguous = expectBridgeError(await capture(hub.callTarget(parseTarget("42"), {}, "sel.get", {})));
+  expect(ambiguous.code).toBe("TARGET");
+  expect(ambiguous.message).toContain("42~2");
+  const exact = hub.callTarget(parseTarget("42~2"), {}, "sel.get", {}, { timeoutMs: 2_000 });
+  const [job] = (await jobsFrom(await pull("s-duplicate"))).jobs;
+  await push({ session: "s-duplicate", results: [{ id: job!.id, ok: true, data: [] }] });
+  expect(await exact).toEqual([]);
 });
 
-test("handshake refuses a proto mismatch and asks for a plugin update", async () => {
-  const res = await handshake({ proto: PROTO_VERSION + 1 });
-  expect(res.accepted).toBe(false);
-  expect(res.updatePlugin).toBe(true);
+test("handshake refuses a proto mismatch naming both versions and the install command", async () => {
+  const res = await fetch(`${base}/handshake`, {
+    method: "POST",
+    headers: { "x-ogsync-plugin": "1" },
+    body: JSON.stringify({ proto: 1, session: "s-old", role: "edit", pluginVersion: "0.0.1", placeId: 42, placeName: "Place2" }),
+  });
+  const body = (await res.json()) as HandshakeResponse;
+  expect(body.accepted).toBe(false);
+  expect(body.updatePlugin).toBe(true);
+  expect(body.reason).toContain("proto 1");
+  expect(body.reason).toContain(`proto ${PROTO_VERSION}`);
+  expect(body.reason).toContain("ogsync plugin install");
 });
 
 test("handshake accepts a version-drifted plugin but flags updatePlugin", async () => {
@@ -272,18 +291,17 @@ test("unknown routes 404 and every JSON response carries serverVersion", async (
   expect(await res.json()).toMatchObject({ serverVersion: VERSION });
 });
 
-test("without target_place the first edit session wins and later ones are refused", async () => {
-  hub.stop();
-  hub = new Hub({ config: config({ target_place: null }), version: VERSION, port: 0, longPollMs: LONG_POLL_MS });
-  hub.listen();
-  base = `http://127.0.0.1:${hub.port}`;
+test("without target_place one place is the target and two are an explicit error", async () => {
+  restart({ target_place: null });
   expect((await handshake({ session: "s-first", placeName: "Anything" })).accepted).toBe(true);
   expect(hub.bound()?.session).toBe("s-first");
-  // Silently binding a second place would let sync write to the wrong game.
-  const second = await handshake({ session: "s-second", placeName: "OtherPlace", placeId: 99 });
-  expect(second.accepted).toBe(false);
-  expect(second.reason).toMatch(/target_place/);
-  expect(hub.bound()?.session).toBe("s-first");
+  // Picking "first connected" would let sync and tools drive the wrong game.
+  expect((await handshake({ session: "s-second", placeName: "OtherPlace", placeId: 99 })).accepted).toBe(true);
+  expect(hub.bound()).toBeNull();
+  const err = expectBridgeError(await capture(hub.call("sel.get", {})));
+  expect(err.code).toBe("TARGET");
+  expect(err.message).toContain("2 places connected");
+  expect(err.message).toContain("99 (OtherPlace)");
 });
 
 test("plugin endpoints refuse requests a web page could make", async () => {
@@ -335,4 +353,153 @@ test("a non-loopback bind is refused outright", () => {
   expect(isLoopbackHost("127.0.0.1")).toBe(true);
   expect(isLoopbackHost("[::1]")).toBe(true);
   expect(isLoopbackHost("192.168.1.10")).toBe(false);
+});
+
+function restart(bind: Partial<OgsyncConfig["bind"]> = { target_place: "Place2" }, extra: Partial<ConstructorParameters<typeof Hub>[0]> = {}): void {
+  hub.stop();
+  hub = new Hub({ config: config(bind), version: VERSION, port: 0, longPollMs: LONG_POLL_MS, ...extra });
+  hub.listen();
+  base = `http://127.0.0.1:${hub.port}`;
+}
+
+function caller(id: string): Caller {
+  return { id, playtest: { ...CONFIG_DEFAULTS.playtest } };
+}
+
+async function report(state: string, session = "s-edit", extra: Record<string, unknown> = {}): Promise<void> {
+  await push({ session, events: [{ ev: "playtestState", state, hb: true, ...extra } as BridgeEvent] });
+}
+
+async function answerNext(session: string, data: unknown): Promise<string> {
+  const [job] = (await jobsFrom(await pull(session))).jobs;
+  await push({ session, results: [{ id: job!.id, ok: true, data }] });
+  return job!.op;
+}
+
+test("ops to one place run one at a time, round-robin across clients", async () => {
+  await handshake();
+  const order: string[] = [];
+  const a1 = runAs(caller("a"), () => hub.call("sel.get", { n: "a1" }, { timeoutMs: 2_000 }));
+  const a2 = runAs(caller("a"), () => hub.call("sel.get", { n: "a2" }, { timeoutMs: 2_000 }));
+  const b1 = runAs(caller("b"), () => hub.call("sel.get", { n: "b1" }, { timeoutMs: 2_000 }));
+  let cursor = 0;
+  for (let i = 0; i < 3; i += 1) {
+    const delivered = await jobsFrom(await pull("s-edit", cursor));
+    cursor = delivered.cursor;
+    expect(delivered.jobs).toHaveLength(1);
+    const job = delivered.jobs[0]!;
+    order.push((job.args as { n: string }).n);
+    await push({ results: [{ id: job.id, ok: true, data: [] }] });
+  }
+  await Promise.all([a1, a2, b1]);
+  expect(order).toEqual(["a1", "b1", "a2"]);
+});
+
+test("a re-handshake of the same session redelivers in-flight jobs instead of failing them", async () => {
+  await handshake();
+  const call = hub.call("inst.get", { path: "game" }, { timeoutMs: 2_000 });
+  const first = await jobsFrom(await pull());
+  // ack by cursor: the job is now in flight, not queued
+  const parked = pull("s-edit", first.cursor);
+  await Bun.sleep(20);
+  await handshake();
+  expect((await parked).status).toBe(204);
+  const again = await jobsFrom(await pull());
+  expect(again.jobs.map((job) => job.id)).toEqual(first.jobs.map((job) => job.id));
+  await push({ results: [{ id: again.jobs[0]!.id, ok: true, data: "ok" }] });
+  expect(await call).toBe("ok");
+});
+
+test("an expired peer's calls wait for the place to re-attach within the grace window", async () => {
+  restart(undefined, { sessionTtlMs: 150, sweepMs: 20, graceMs: 2_000 });
+  await handshake();
+  const delivered = capture(hub.call("inst.get", {}, { timeoutMs: 3_000 }));
+  await jobsFrom(await pull());
+  await Bun.sleep(300); // swept: no pull for longer than the TTL
+  expect(hub.sessions()).toHaveLength(0);
+  const queued = hub.call("sel.get", {}, { timeoutMs: 3_000 });
+
+  // A new plugin load (new session id) takes the slot: the job it may already
+  // have run fails honestly, the one it never saw is delivered.
+  await handshake({ session: "s-new" });
+  const err = expectBridgeError(await capture(delivered));
+  expect(err.code).toBe("NOPLUGIN");
+  expect(err.message).toContain("may or may not have run");
+  expect(await answerNext("s-new", ["game.Workspace"])).toBe("sel.get");
+  expect(await queued).toEqual(["game.Workspace"]);
+});
+
+test("target roles route to the play server, client-N with ctx=client and the player index", async () => {
+  await handshake();
+  await handshake({ session: "s-play", role: "server" });
+  const call = hub.callTarget(parseTarget("Place2:client-2"), {}, "inst.get", { path: "game" }, { timeoutMs: 2_000 });
+  const [job] = (await jobsFrom(await pull("s-play"))).jobs;
+  expect(job!.args).toEqual({ path: "game", ctx: "client", player: 2 });
+  await push({ session: "s-play", results: [{ id: job!.id, ok: true, data: 1 }] });
+  expect(await call).toBe(1);
+  const noServer = expectBridgeError(await capture(hub.callTarget(parseTarget("Place2:edit"), {}, "sel.get", {}, { timeoutMs: 50 })));
+  expect(noServer.code).toBe("TIMEOUT");
+});
+
+test("playtest start records a lease; another client cannot stop it without force", async () => {
+  await handshake();
+  await report("idle");
+  const start = runAs(caller("agent-a"), () => hub.call("play.start", { mode: "solo" }, { timeoutMs: 2_000 }));
+  expect(await answerNext("s-edit", { started: "solo" })).toBe("play.start");
+  expect(await start).toEqual({ started: "solo" });
+  expect(hub.place()?.playtest.state).toBe("starting");
+  await report("running", "s-edit", { mode: "play" });
+  expect(hub.place()?.playtest).toMatchObject({ state: "running", owner: "agent-a", startedBy: "agent" });
+
+  const again = await runAs(caller("agent-a"), () => hub.call("play.start", { mode: "solo" }));
+  expect(again).toMatchObject({ already: true });
+  const otherStart = expectBridgeError(await capture(runAs(caller("agent-b"), () => hub.call("play.start", {}))));
+  expect(otherStart.code).toBe("LEASE");
+  const refused = expectBridgeError(await capture(runAs(caller("agent-b"), () => hub.call("play.stop", {}))));
+  expect(refused.code).toBe("LEASE");
+  expect(refused.message).toContain("agent-a");
+
+  const forced = runAs(caller("agent-b"), () => hub.call("play.stop", { force: true }, { timeoutMs: 2_000 }));
+  expect(await answerNext("s-edit", { stopped: true })).toBe("play.stop");
+  await forced;
+  expect(hub.place()?.playtest.state).toBe("stopping");
+  await report("idle");
+  expect(hub.place()?.playtest).toMatchObject({ state: "idle", owner: null });
+});
+
+test("a playtest started in Studio is never stopped without force, and stop when idle is a no-op", async () => {
+  await handshake();
+  await report("idle");
+  expect(await runAs(caller("agent"), () => hub.call("play.stop", {}))).toEqual({ stopped: false, state: "idle" });
+  await handshake({ session: "s-play", role: "server" });
+  await report("running", "s-play", { players: 1 });
+  expect(hub.place()?.playtest).toMatchObject({ state: "running", startedBy: "user", owner: null, players: 1 });
+  const err = expectBridgeError(await capture(runAs(caller("agent"), () => hub.call("play.stop", {}))));
+  expect(err.code).toBe("LEASE");
+  expect(err.message).toContain("started in Studio");
+});
+
+test("GET /state and /id answer without auth and with the playtest shape hooks read", async () => {
+  await handshake();
+  const id = (await (await fetch(`${base}/id`)).json()) as IdResponse;
+  expect(id).toMatchObject({ service: "ogsync", version: VERSION, proto: PROTO_VERSION });
+  let state = (await (await fetch(`${base}/state`)).json()) as StateResponse;
+  expect(state.daemon).toMatchObject({ version: VERSION, proto: PROTO_VERSION, port: hub.port });
+  expect(state.places[0]).toMatchObject({ key: "42", name: "Place2", peers: [{ role: "edit", session: "s-edit" }] });
+  // No heartbeat yet: consumers must be able to fail closed.
+  expect(state.places[0]!.playtest).toMatchObject({ state: "unknown", heartbeatAgeMs: null });
+  await report("idle");
+  state = (await (await fetch(`${base}/state`)).json()) as StateResponse;
+  expect(state.places[0]!.playtest.state).toBe("idle");
+  expect(state.places[0]!.playtest.heartbeatAgeMs).toBeLessThan(1_000);
+});
+
+test("a goodbye drops the peer at once and fails its calls", async () => {
+  await handshake();
+  const call = capture(hub.call("inst.get", {}, { timeoutMs: 2_000 }));
+  await jobsFrom(await pull());
+  await push({ events: [{ ev: "goodbye" }] });
+  expect(expectBridgeError(await call).code).toBe("NOPLUGIN");
+  expect(hub.sessions()).toHaveLength(0);
+  expect(hub.state().places).toHaveLength(0);
 });
