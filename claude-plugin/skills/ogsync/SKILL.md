@@ -1,6 +1,6 @@
 ---
 name: ogsync
-description: How to drive Roblox Studio through the OGSync tools (mcp__ogsync__* or `ogsync call` from a shell) - targeting a place, playtests and their ownership, running code in the game VM, async jobs, waiting instead of polling, screenshots, clicks, place edits, and what each error code asks you to do. Read before the first OGSync call in a session, and whenever an OGSync call returns an ERR code.
+description: How to drive Roblox Studio through the OGSync tools (mcp__plugin_ogsync_ogsync__* or `ogsync call` from a shell) - targeting a place, playtests and their ownership, running code in the game VM, async jobs, waiting instead of polling, screenshots, clicks, place edits, and what each error code asks you to do. Read before the first OGSync call in a session, and whenever an OGSync call returns an ERR code.
 ---
 
 # Driving Roblox Studio with OGSync
@@ -9,7 +9,7 @@ OGSync is one daemon per machine. Every Claude session, subagent and shell reach
 
 ## Reaching Studio
 
-- MCP tools are `mcp__ogsync__<tool>`. An agent without MCP access runs the same tools from a shell: `ogsync call <tool> '<json-args>'`. `ogsync status` prints connected places, peers and playtest state.
+- MCP tools are `mcp__plugin_ogsync_ogsync__<tool>`. An agent without MCP access runs the same tools from a shell: `ogsync call <tool> '<json-args>'`, or `ogsync call <tool> -` with the JSON on stdin for large arguments such as script sources (Windows caps a command line near 32 KB). The binary is `~/.ogsync/bin/ogsync.exe` when `ogsync` is not on PATH. `ogsync status` prints connected places, peers and playtest state.
 - Every tool takes `target`: `<place>[:<role>]`. The place is an alias from `ogsync.toml`, a place id, a place key or the place name; the role is `edit`, `server`, `client` or `client-N`. Without `target` the call goes to `bind.target_place` from the `ogsync.toml` in your working directory.
 - `ERR TARGET` lists the candidates. Pick one and pass it; never guess.
 
