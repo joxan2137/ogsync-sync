@@ -111,9 +111,16 @@ PlayState.onChange(fn): () -> ()
 - **Transport (Net)**: never pinned to a port. A handshake that cannot connect
   scans `Ports.order(lastGood)` with `GET /id` and follows the daemon; a pull
   that cannot connect, or a pull/push answered 400/404/409, falls back to the
-  handshake (same session id, so the daemon re-adopts the peer). Jobs pass
-  through `JobLog`: an id already running or done is skipped, so jobs the
-  daemon redelivers after a reconnect never run twice.
+  handshake (same session id and token, so the daemon re-adopts the peer).
+  Pull/push carry `X-OGSync-Token` from the handshake; `Net.start` begins a
+  new registration (no token). Throttled HttpService calls only back off.
+  Daemons answering `/id` with another proto are skipped; a handshake
+  mismatch shows "Update required" and retries every 30 s. Jobs arriving on
+  push responses run like pulled ones. Jobs pass through `JobLog`: an id
+  already running or done is skipped (running ids are never evicted), so jobs
+  the daemon redelivers after a reconnect never run twice.
+- **Role detection** also treats `RunService:IsRunMode()` (F8 Run simulates in
+  the edit DataModel) as `edit`.
 - **Lifecycle**: edit and play-server roles push `{ev: "playtestState",
   state, mode?, players?, hb: true}` within 1 s of a change and every 5 s
   regardless; edit state is `PlayState.snapshot(RunService:IsRunning())`, the

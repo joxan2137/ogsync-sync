@@ -144,7 +144,8 @@ async function daemon(args: Args): Promise<number> {
   if (action === "run") return runDaemon({ port: portFlag(args) });
   if (action === "detach") {
     launchDaemon(portFlag(args));
-    return 0;
+    // Nothing may keep this hop alive: the daemon's parent must be gone.
+    process.exit(0);
   }
   if (action === "start") {
     const started = await ensureDaemon({ port: portFlag(args) });

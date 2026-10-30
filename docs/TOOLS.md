@@ -132,8 +132,9 @@ Long-poll until a condition holds, instead of retrying a tool. `for`:
 - `attribute` — `path`, `name`, `value?` (omitted: until the attribute exists).
 - `instance` — `path` (until it exists).
 `timeoutMs` (default 30000, max 300000). Log and playtest waits read daemon
-state; attribute/instance re-check through the plugin every 500 ms via the
-fair queue. Returns `wait ok: …`, or `ERR TIMEOUT: …` naming the last state seen.
+state; attribute/instance re-check through the plugin via the fair queue,
+starting at 500 ms and backing off ×1.5 to every 4 s (Studio's HttpService
+budget). Returns `wait ok: …`, or `ERR TIMEOUT: …` naming the last state seen.
 
 ## screenshot
 `target` (`viewport` default), `camera_focus?` (path — frame instance before

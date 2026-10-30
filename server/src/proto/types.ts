@@ -35,6 +35,8 @@ export interface SessionInfo {
 export interface HandshakeRequest {
   proto: number;
   session: string;
+  /** Secret from this session's previous handshake; proves a reconnect, not a new plugin load. */
+  token?: string;
   role: Role;
   pluginVersion: string;
   placeId: number;
@@ -50,6 +52,8 @@ export interface HandshakeResponse {
   syncEnabled: boolean;
   projectName?: string;
   placeKey?: string;
+  /** Per-registration secret: send as X-OGSync-Token on every pull and push. */
+  token?: string;
 }
 
 export interface Job {
@@ -240,7 +244,6 @@ export interface PlaytestInfo {
 
 export interface PeerState {
   role: Role;
-  session: string;
   pluginVersion: string;
   ageMs: number;
 }

@@ -20,13 +20,21 @@ On Windows the daemon first reads `netsh int ipv4 show excludedportrange
 protocol=tcp` and skips candidates inside a Hyper-V/WSL reservation (those
 blocks move across reboots). An explicit `--port`, `OGSYNC_PORT` or
 `daemon.port` is tried before the list. The bound port is published in
-`~/.ogsync/daemon.json` `{pid, port, version, proto, startedAt}`;
-`~/.ogsync/daemon.lock` (exclusive create, holds the pid; a dead pid is stale)
-keeps it to one daemon. `OGSYNC_HOME` relocates `~/.ogsync`.
+`~/.ogsync/daemon.json` `{pid, port, version, proto, startedAt}`, trusted
+only when that port's `GET /id` answers with the same pid.
+`~/.ogsync/daemon.lock` keeps it to one daemon: `{pid, nonce, at}`, created
+complete (temp file hard-linked into place). It is live while younger than
+10 s, or while its pid is alive and answers `/id` as that pid; a stale lock is
+taken over by renaming it to a unique name (one rename wins). A daemon
+re-checks that it still holds its lock after binding and every 15 s, and exits
+if not. `OGSYNC_HOME` relocates `~/.ogsync`. A preferred port outside the list
+is warned about: the plugin finds it only if its panel names it.
 
 The plugin tries its last good port (or the panel's port) first. When a
-handshake cannot connect it scans the list with `GET /id` and follows the
-daemon wherever it answers; it never stays pinned to a dead port. A pull that
+handshake cannot connect it scans the list with `GET /id`, skips daemons of
+another proto, and follows a matching one wherever it answers; it never stays
+pinned to a dead port. HttpService throttling ("requests exceeded limit") is
+only backoff: it never drops the session or triggers a rescan. A pull that
 cannot connect drops back to the handshake path, so a moved or restarted
 daemon is found the same way.
 
@@ -47,13 +55,21 @@ daemon is found the same way.
 ## Endpoints
 
 ### POST /handshake
-Plugin → `{proto: 2, session, role, pluginVersion, placeId, placeName}`.
+Plugin → `{proto: 2, session, role, pluginVersion, placeId, placeName,
+token?}`.
 Daemon → `{proto: 2, serverVersion, accepted: bool, reason?, updatePlugin:
-bool, syncEnabled: bool, projectName?, placeKey?}`.
+bool, syncEnabled: bool, projectName?, placeKey?, token}`.
+`token` is a per-registration secret: every pull and push sends it as
+`X-OGSync-Token`, and a wrong or missing one answers `409` exactly like an
+unknown session. A re-handshake carrying the current token re-adopts the
+registration; one without it (the plugin restarted its loop) starts a new
+registration under the same id and voids the old secret, so a late goodbye
+from the old one is refused.
 Every place is accepted. `accepted:false` only for a malformed request or a
 proto mismatch, whose `reason` names both versions and the fix ("plugin speaks
 proto 1, daemon speaks proto 2: run `ogsync plugin install` (or restart
-`ogsync serve`) and reload plugins in Studio"); the plugin then shows "Update required" and stops. Only `ogsync plugin
+`ogsync serve`) and reload plugins in Studio"); the plugin then shows "Update required", scans for a daemon of its own proto
+and otherwise retries every 30 s. Only `ogsync plugin
 install` and `ogsync serve` ever write the plugin file, never the daemon.
 A re-handshake with a known session id re-adopts that peer (same key, same
 slot); a daemon restart answers `409` to pull/push and the plugin
@@ -89,7 +105,11 @@ set a custom header without a preflight the daemon never answers. Studio's
 
 ### POST /push
 Plugin → `{session, results?: [{id, ok: bool, data?, err?, partial?: bool}],
-events?: [Event]}`. `partial:true` streams incremental output for long jobs
+events?: [Event]}`. When the pushed results free the place's queue, the next
+job rides back on this response (`{ok: true, jobs: [...]}`, already acked)
+instead of waking the parked pull: one request per job, not two, against
+Studio's HttpService budget. A push that fails in transport sends the plugin
+back through the handshake, which redelivers anything it may have missed. `partial:true` streams incremental output for long jobs
 (playtest logs, profiling); final result has `partial` absent.
 Daemon → `{ok: true}`.
 
@@ -103,7 +123,8 @@ answers `409`; the plugin re-handshakes.
   mode?: "play"|"run", players?, hb: true}` — pushed on change and every 5 s
   by edit and play-server peers; `stopped` from a play peer drops it
 - `{ev: "goodbye"}` — plugin unloading or disconnecting: the peer is dropped
-  at once and its calls fail `NOPLUGIN`
+  at once and its calls fail `NOPLUGIN`. A play server sends `playtestState
+  stopped` in the same push first.
 - `{ev: "selection", paths}`
 - `{ev: "syncToggle", paused}` — user hit Pause/Resume in the plugin panel
 - `{ev: "resolveConflict", file, keep: "fs"|"studio"}` — panel conflict button
@@ -118,7 +139,7 @@ Never authenticated, answered from memory (no Studio round trip):
 ```
 {daemon: {version, proto, pid, port, startedAt},
  places: [{key, name, placeId,
-           peers: [{role, session, pluginVersion, ageMs}],
+           peers: [{role, pluginVersion, ageMs}],
            playtest: {state: "idle"|"starting"|"running"|"stopping"|"unknown",
                       mode, owner, startedBy: "agent"|"user"|null, since,
                       heartbeatAgeMs, players, stale, warning}}]}
@@ -131,9 +152,10 @@ peers vanished without a goodbye stays listed (as `unknown`) for 2 minutes.
 `ogsync status --json` prints this body.
 
 ### GET /health
-`{service: "ogsync", version, proto, sessions: [{session, role, placeName,
-placeId, placeKey, pluginVersion, age}], bound: session|null, sync: {enabled,
-pending, conflicts}}`. Diagnostics. Never authenticated.
+`{service: "ogsync", version, proto, sessions: [{role, placeName, placeId,
+placeKey, pluginVersion, age}], bound: placeKey|null, sync: {enabled,
+pending, conflicts}}`. Diagnostics. Never authenticated. Session ids never
+appear on open routes: pull/push key on them.
 
 ### POST /rpc  (clients: session proxies, CLI)
 `{tool, args, caller: {id, cwd?, label?}}` → the tool executed in the daemon,
@@ -175,9 +197,10 @@ and add `127.0.0.1,localhost,::1` to `NO_PROXY`/`no_proxy` at startup, because
 Bun honours `HTTP(S)_PROXY` for loopback too. Outgoing internet requests keep
 the user's proxy. A refused connection means the daemon is gone: the client
 respawns it and retries that request once; nothing else is retried. A client
-that finds a daemon speaking another proto stops it (`POST /shutdown`) and
-starts its own; a mere version difference is only logged (`ogsync daemon stop`
-picks up a new build on the next call).
+that finds a daemon speaking an older proto stops it (`POST /shutdown`), waits
+for its pid to exit, and starts its own; a newer-proto daemon is left alone and
+the client fails with `VERSION` (update ogsync). A mere version difference is
+only logged (`ogsync daemon stop` picks up a new build on the next call).
 
 ## Jobs (daemon → plugin ops)
 
@@ -204,8 +227,14 @@ reports (`playtestState` heartbeats) plus play-server peer presence:
 stop. A start that is not reported running within 30 s returns to `idle`
 with a warning.
 
-- **Leases.** `play.start` records the calling client as owner; a second
-  start by the owner answers `{already: true}`, by anyone else `LEASE`.
+- **Leases.** `play.start` records the calling client as owner; its 30 s
+  start timeout counts from when the op reaches the plugin, not from
+  admission. The agent is credited only when the plugin's result says it
+  launched the test; `{already: true}` from the plugin means someone else did
+  (no lease, `startedBy: "user"`). A second start by the owner answers
+  `{already: true, yours: true}`, by anyone else `LEASE`. A stop while the
+  owner's start is still queued cancels it (`{stopped: false, state: "idle",
+  cancelledStart: true}`).
   `play.stop` by a non-owner, of a playtest no agent started (`startedBy:
   "user"`), or while `unknown`, is refused with `LEASE` unless `force: true`.
   Stop while idle answers `{stopped: false, state: "idle"}`.

@@ -36,7 +36,8 @@ local function testJobLog()
 	check("redelivery after finishing is skipped", JobLog.begin(log, "a") == "done")
 	JobLog.begin(log, "b")
 	JobLog.begin(log, "c")
-	check("oldest ids are evicted at capacity", JobLog.begin(log, "a") == "new")
+	check("oldest finished ids are evicted at capacity", JobLog.begin(log, "a") == "new")
+	check("running ids are never evicted", JobLog.begin(log, "b") == "running" and JobLog.begin(log, "c") == "running")
 end
 
 local function testPlayState()

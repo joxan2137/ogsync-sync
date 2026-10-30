@@ -35,6 +35,7 @@ beforeEach(() => {
 
 afterEach(() => {
   hub.stop();
+  tokens.clear();
 });
 
 async function handshake(overrides: Partial<HandshakeRequest> = {}): Promise<HandshakeResponse> {
@@ -50,23 +51,33 @@ async function handshake(overrides: Partial<HandshakeRequest> = {}): Promise<Han
   const res = await fetch(`${base}/handshake`, {
     method: "POST",
     headers: PLUGIN_HEADERS,
-    body: JSON.stringify(body),
+    body: JSON.stringify({ token: tokens.get(body.session), ...body }),
   });
-  return (await res.json()) as HandshakeResponse;
+  const answer = (await res.json()) as HandshakeResponse;
+  if (answer.token !== undefined) tokens.set(body.session, answer.token);
+  return answer;
+}
+
+/** Per-session secrets from the last handshake; pull/push present them. */
+const tokens = new Map<string, string>();
+
+function sessionHeaders(session: string): Record<string, string> {
+  return { ...PLUGIN_HEADERS, "x-ogsync-token": tokens.get(session) ?? "" };
 }
 
 /** Plugin endpoints require this; browsers cannot set it without a preflight. */
 const PLUGIN_HEADERS = { "x-ogsync-plugin": String(PROTO_VERSION) };
 
 async function pull(session = "s-edit", cursor = 0): Promise<Response> {
-  return fetch(`${base}/pull?session=${session}&cursor=${cursor}`, { headers: PLUGIN_HEADERS });
+  return fetch(`${base}/pull?session=${session}&cursor=${cursor}`, { headers: sessionHeaders(session) });
 }
 
 async function push(body: Partial<PushRequest>): Promise<Response> {
+  const session = body.session ?? "s-edit";
   return fetch(`${base}/push`, {
     method: "POST",
-    headers: PLUGIN_HEADERS,
-    body: JSON.stringify({ session: "s-edit", ...body }),
+    headers: sessionHeaders(session),
+    body: JSON.stringify({ session, ...body }),
   });
 }
 
@@ -252,7 +263,8 @@ test("health reports sessions, binding and sync state", async () => {
   expect(health.service).toBe("ogsync");
   expect(health.version).toBe(VERSION);
   expect(health.proto).toBe(PROTO_VERSION);
-  expect(health.bound).toBe("s-edit");
+  expect(health.bound).toBe("42");
+  expect(JSON.stringify(health)).not.toContain("s-edit");
   expect(health.sessions[0]!.role).toBe("edit");
   expect(health.sync).toEqual({ enabled: true, pending: 0, conflicts: 0 });
 });
@@ -330,7 +342,7 @@ test("a session cannot answer another session's job", async () => {
   expect(job).toBeDefined();
   const stolen = await fetch(`${base}/push`, {
     method: "POST",
-    headers: PLUGIN_HEADERS,
+    headers: sessionHeaders("s-play"),
     body: JSON.stringify({ session: "s-play", results: [{ id: job!.id, ok: true, data: ["forged"] }] }),
   });
   expect(stolen.status).toBe(200);
@@ -382,14 +394,14 @@ test("ops to one place run one at a time, round-robin across clients", async () 
   const a1 = runAs(caller("a"), () => hub.call("sel.get", { n: "a1" }, { timeoutMs: 2_000 }));
   const a2 = runAs(caller("a"), () => hub.call("sel.get", { n: "a2" }, { timeoutMs: 2_000 }));
   const b1 = runAs(caller("b"), () => hub.call("sel.get", { n: "b1" }, { timeoutMs: 2_000 }));
-  let cursor = 0;
+  let jobs = (await jobsFrom(await pull())).jobs;
   for (let i = 0; i < 3; i += 1) {
-    const delivered = await jobsFrom(await pull("s-edit", cursor));
-    cursor = delivered.cursor;
-    expect(delivered.jobs).toHaveLength(1);
-    const job = delivered.jobs[0]!;
+    expect(jobs).toHaveLength(1);
+    const job = jobs[0]!;
     order.push((job.args as { n: string }).n);
-    await push({ results: [{ id: job.id, ok: true, data: [] }] });
+    // The next admitted job rides back on the push that freed the slot.
+    const res = await push({ results: [{ id: job.id, ok: true, data: [] }] });
+    jobs = ((await res.json()) as { jobs?: typeof jobs }).jobs ?? [];
   }
   await Promise.all([a1, a2, b1]);
   expect(order).toEqual(["a1", "b1", "a2"]);
@@ -485,7 +497,9 @@ test("GET /state and /id answer without auth and with the playtest shape hooks r
   expect(id).toMatchObject({ service: "ogsync", version: VERSION, proto: PROTO_VERSION });
   let state = (await (await fetch(`${base}/state`)).json()) as StateResponse;
   expect(state.daemon).toMatchObject({ version: VERSION, proto: PROTO_VERSION, port: hub.port });
-  expect(state.places[0]).toMatchObject({ key: "42", name: "Place2", peers: [{ role: "edit", session: "s-edit" }] });
+  expect(state.places[0]).toMatchObject({ key: "42", name: "Place2", peers: [{ role: "edit" }] });
+  // Session ids key pull/push; open routes never show them.
+  expect(JSON.stringify(state)).not.toContain("s-edit");
   // No heartbeat yet: consumers must be able to fail closed.
   expect(state.places[0]!.playtest).toMatchObject({ state: "unknown", heartbeatAgeMs: null });
   await report("idle");
@@ -502,4 +516,65 @@ test("a goodbye drops the peer at once and fails its calls", async () => {
   expect(expectBridgeError(await call).code).toBe("NOPLUGIN");
   expect(hub.sessions()).toHaveLength(0);
   expect(hub.state().places).toHaveLength(0);
+});
+
+test("pull and push need the handshake secret; a re-registration voids the old one", async () => {
+  const first = await handshake();
+  const forged = await fetch(`${base}/pull?session=s-edit&cursor=0`, { headers: PLUGIN_HEADERS });
+  expect(forged.status).toBe(409);
+  tokens.delete("s-edit"); // plugin restarted its loop: no secret to prove a reconnect
+  const second = await handshake();
+  expect(second.token).not.toBe(first.token);
+  // A goodbye still carrying the old secret is a stranger's and changes nothing.
+  const late = await fetch(`${base}/push`, {
+    method: "POST",
+    headers: { ...PLUGIN_HEADERS, "x-ogsync-token": first.token! },
+    body: JSON.stringify({ session: "s-edit", events: [{ ev: "goodbye" }] }),
+  });
+  expect(late.status).toBe(409);
+  expect(hub.sessions()).toHaveLength(1);
+});
+
+test("a job admitted by a pushed result rides back on the push response", async () => {
+  await handshake();
+  const first = hub.call("sel.get", { n: 1 }, { timeoutMs: 2_000 });
+  const second = hub.call("sel.get", { n: 2 }, { timeoutMs: 2_000 });
+  const delivered = await jobsFrom(await pull());
+  expect(delivered.jobs).toHaveLength(1);
+  const parked = pull("s-edit", delivered.cursor);
+  const res = await push({ results: [{ id: delivered.jobs[0]!.id, ok: true, data: [] }] });
+  const body = (await res.json()) as { jobs?: { id: string; args: { n: number } }[] };
+  expect(body.jobs?.map((job) => job.args.n)).toEqual([2]);
+  await push({ results: [{ id: body.jobs![0]!.id, ok: true, data: ["x"] }] });
+  expect(await first).toEqual([]);
+  expect(await second).toEqual(["x"]);
+  // The parked pull was never woken for it, and never resends it.
+  expect((await parked).status).toBe(204);
+});
+
+test("a stop cancels a play.start still queued behind another op", async () => {
+  await handshake();
+  await report("idle");
+  const busy = hub.call("sel.get", {}, { timeoutMs: 2_000 });
+  const busyJob = (await jobsFrom(await pull())).jobs[0]!;
+  const start = capture(runAs(caller("a"), () => hub.call("play.start", { mode: "solo" }, { timeoutMs: 2_000 })));
+  expect(hub.place()?.playtest.state).toBe("starting");
+  const stop = await runAs(caller("a"), () => hub.call("play.stop", {}));
+  expect(stop).toEqual({ stopped: false, state: "idle", cancelledStart: true });
+  const err = expectBridgeError(await start);
+  expect(err.code).toBe("LEASE");
+  expect(hub.place()?.playtest).toMatchObject({ state: "idle", owner: null });
+  await push({ results: [{ id: busyJob.id, ok: true, data: [] }] });
+  await busy;
+});
+
+test("a start the plugin answers `already` leaves no lease and credits the user", async () => {
+  await handshake();
+  await report("idle");
+  const start = runAs(caller("a"), () => hub.call("play.start", { mode: "solo" }, { timeoutMs: 2_000 }));
+  const job = (await jobsFrom(await pull())).jobs[0]!;
+  await report("running", "s-edit", { mode: "play" });
+  await push({ results: [{ id: job.id, ok: true, data: { already: true, mode: "play" } }] });
+  expect(await start).toMatchObject({ already: true, yours: false });
+  expect(hub.place()?.playtest).toMatchObject({ state: "running", owner: null, startedBy: "user" });
 });

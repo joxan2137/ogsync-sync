@@ -1,12 +1,19 @@
-// One daemon per machine. `~/.ogsync/daemon.lock` is created exclusively and
-// holds the owner's pid, so two sessions racing to spawn a daemon end up with
-// one; a lock whose pid is dead is stale and taken over. `daemon.json`
-// publishes the bound port for every client, plugin scans aside.
+// One daemon per machine. `~/.ogsync/daemon.lock` holds `{pid, nonce, at}` and
+// is created complete (written to a temp name, then hard-linked into place),
+// so no contender ever reads a half-written lock. A lock is live while it is
+// young, or while its pid is alive AND answers GET /id as that pid (a reused
+// pid answers nothing). A stale lock is taken over by renaming it to a unique
+// name: only one rename of that file can win. `daemon.json` publishes the
+// bound port for every client, plugin scans aside.
 
-import { closeSync, existsSync, openSync, readFileSync, renameSync, rmSync, writeFileSync, writeSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import { existsSync, linkSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { ogsyncHome } from "../config.ts";
 import { log } from "../log.ts";
+
+/** A lock this young is live whatever its pid says: its owner may not have bound a port yet. */
+export const LOCK_GRACE_MS = 10_000;
 
 export interface DaemonRecord {
   pid: number;
@@ -17,8 +24,19 @@ export interface DaemonRecord {
 }
 
 export interface DaemonLock {
+  /** False once another process took the lock over; the daemon must then exit. */
+  held(): boolean;
   release(): void;
 }
+
+interface LockContent {
+  pid: number;
+  nonce: string;
+  at: number;
+}
+
+/** Whether a live process with this pid answers as the ogsync daemon. */
+export type HolderProbe = (pid: number) => Promise<boolean>;
 
 export function lockFile(): string {
   return join(ogsyncHome(), "daemon.lock");
@@ -43,39 +61,104 @@ export function isAlive(pid: number): boolean {
   }
 }
 
-/** null when a live process already holds the lock. */
-export function acquireLock(pid = process.pid): DaemonLock | null {
+/** null when a live daemon already holds the lock. */
+export async function acquireLock(answers: HolderProbe, pid = process.pid): Promise<DaemonLock | null> {
   const file = lockFile();
-  for (let attempt = 0; attempt < 2; attempt += 1) {
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const mine: LockContent = { pid, nonce: randomUUID(), at: Date.now() };
+    if (createExclusive(file, mine)) return lockHandle(mine);
+    const seen = readRaw(file);
+    if (seen === null) continue;
+    if (await isLive(seen, pid, answers)) return null;
+    const parked = `${file}.stale-${pid}-${mine.nonce}`;
     try {
-      const fd = openSync(file, "wx");
-      writeSync(fd, String(pid));
-      closeSync(fd);
-      return { release: () => releaseLock(pid) };
-    } catch (err) {
-      if ((err as { code?: string }).code !== "EEXIST") throw err;
-      const holder = lockHolder();
-      if (holder !== null && holder !== pid && isAlive(holder)) return null;
-      log.info(`removing stale daemon lock (pid ${holder ?? "?"} is gone)`);
-      rmSync(file, { force: true });
+      renameSync(file, parked);
+    } catch {
+      continue; // another contender moved it first
     }
+    const taken = readRaw(parked);
+    if (taken?.text !== seen.text) {
+      // The lock changed hands between our read and our rename: give it back
+      // unless someone has already re-created the name, and stand down.
+      try {
+        linkSync(parked, file);
+      } catch {
+        // the name is taken again; its owner keeps it
+      }
+      rmSync(parked, { force: true });
+      return null;
+    }
+    rmSync(parked, { force: true });
+    log.info(`took over a stale daemon lock (pid ${seen.content?.pid ?? "?"})`);
   }
   return null;
 }
 
 export function lockHolder(): number | null {
+  return readRaw(lockFile())?.content?.pid ?? null;
+}
+
+function lockHandle(mine: LockContent): DaemonLock {
+  const held = (): boolean => {
+    const current = readRaw(lockFile())?.content;
+    return current?.pid === mine.pid && current.nonce === mine.nonce;
+  };
+  return {
+    held,
+    release: () => {
+      if (held()) rmSync(lockFile(), { force: true });
+      const record = readDaemonRecord();
+      if (record?.pid === mine.pid) rmSync(recordFile(), { force: true });
+    },
+  };
+}
+
+function createExclusive(file: string, content: LockContent): boolean {
+  const temp = `${file}.${content.pid}.${content.nonce}.tmp`;
+  writeFileSync(temp, JSON.stringify(content));
   try {
-    const pid = Number(readFileSync(lockFile(), "utf8").trim());
-    return Number.isInteger(pid) && pid > 0 ? pid : null;
+    linkSync(temp, file);
+    return true;
+  } catch (err) {
+    if ((err as { code?: string }).code !== "EEXIST") throw err;
+    return false;
+  } finally {
+    rmSync(temp, { force: true });
+  }
+}
+
+function readRaw(file: string): { text: string; content: LockContent | null; mtimeMs: number } | null {
+  try {
+    const text = readFileSync(file, "utf8");
+    return { text, content: parseLock(text), mtimeMs: statSync(file).mtimeMs };
   } catch {
     return null;
   }
 }
 
-function releaseLock(pid: number): void {
-  if (lockHolder() === pid) rmSync(lockFile(), { force: true });
-  const record = readDaemonRecord();
-  if (record?.pid === pid) rmSync(recordFile(), { force: true });
+function parseLock(text: string): LockContent | null {
+  const trimmed = text.trim();
+  if (/^\d+$/.test(trimmed)) return { pid: Number(trimmed), nonce: "", at: 0 }; // pre-nonce format
+  try {
+    const raw = JSON.parse(trimmed) as Partial<LockContent>;
+    if (typeof raw.pid !== "number" || typeof raw.nonce !== "string" || typeof raw.at !== "number") return null;
+    return { pid: raw.pid, nonce: raw.nonce, at: raw.at };
+  } catch {
+    return null;
+  }
+}
+
+async function isLive(
+  seen: { content: LockContent | null; mtimeMs: number },
+  pid: number,
+  answers: HolderProbe,
+): Promise<boolean> {
+  const now = Date.now();
+  const content = seen.content;
+  if (content === null) return now - seen.mtimeMs < LOCK_GRACE_MS;
+  if (content.pid === pid) return false;
+  if (now - Math.max(content.at, seen.mtimeMs) < LOCK_GRACE_MS) return true;
+  return isAlive(content.pid) && (await answers(content.pid));
 }
 
 export function writeDaemonRecord(record: DaemonRecord): void {

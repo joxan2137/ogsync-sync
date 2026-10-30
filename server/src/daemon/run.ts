@@ -11,6 +11,7 @@ import { runAs } from "../hub/caller.ts";
 import { Hub, type RpcCaller } from "../hub/hub.ts";
 import { PollThrottle } from "../hub/throttle.ts";
 import { VERSION } from "../version.ts";
+import { daemonAnswersAs } from "./client.ts";
 import { acquireLock, lockHolder, writeDaemonRecord } from "./lock.ts";
 import { portCandidates, readExcludedRanges } from "./ports.ts";
 import { ATTACH_INTERVAL_MS, Projects } from "./projects.ts";
@@ -19,8 +20,11 @@ export const POLL_THROTTLE_MS = 1_000;
 
 type ToolExecutor = typeof import("../mcp/server.ts").executeTool;
 
+/** A daemon that lost its lock (taken over as stale) steps down within this. */
+const LOCK_CHECK_MS = 15_000;
+
 export async function runDaemon(opts: { port: number | null }): Promise<number> {
-  const lock = acquireLock();
+  const lock = await acquireLock(daemonAnswersAs);
   if (lock === null) {
     log.info(`another ogsync daemon (pid ${lockHolder() ?? "?"}) already holds the lock`);
     return 0;
@@ -37,6 +41,11 @@ export async function runDaemon(opts: { port: number | null }): Promise<number> 
     lock.release();
     throw err;
   }
+  if (!lock.held()) {
+    log.warn("another daemon took the lock while this one was binding; exiting");
+    hub.stop();
+    return 0;
+  }
   writeDaemonRecord({ pid: process.pid, port, version: VERSION, proto: PROTO_VERSION, startedAt: hub.startedAt });
 
   const projects = new Projects(hub);
@@ -51,12 +60,16 @@ export async function runDaemon(opts: { port: number | null }): Promise<number> 
   );
 
   const sweeper = setInterval(() => void projects.sweep(), ATTACH_INTERVAL_MS);
+  const lockCheck = setInterval(() => {
+    if (!lock.held()) shutdown("lock taken over by another daemon");
+  }, LOCK_CHECK_MS);
   let stopping = false;
   const shutdown = (why: string): void => {
     if (stopping) return;
     stopping = true;
     log.info(`daemon stopping: ${why}`);
     clearInterval(sweeper);
+    clearInterval(lockCheck);
     void projects.stopAll().finally(() => {
       hub.stop();
       lock.release();

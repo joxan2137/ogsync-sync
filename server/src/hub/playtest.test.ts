@@ -27,9 +27,17 @@ describe("playtest state machine", () => {
     expect(t.admitStart(A)).toEqual({ kind: "proceed" });
     t.beginStart(A, "solo", LIMITS);
     expect(t.snapshot()).toMatchObject({ state: "starting", owner: "agent-a" });
+    // Queued behind other ops: no start timeout runs until the op is delivered.
+    clock.now += 60_000;
+    t.report("edit", "idle");
+    expect(t.snapshot().state).toBe("starting");
+    t.startDelivered();
     clock.now += 1_000;
     t.report("edit", "running", "play");
     t.serverPeer(true);
+    // Running, but not credited until the plugin says this start launched it.
+    expect(t.snapshot()).toMatchObject({ state: "running", owner: "agent-a", startedBy: null });
+    t.startSucceeded();
     expect(t.snapshot()).toMatchObject({ state: "running", owner: "agent-a", startedBy: "agent", mode: "solo" });
     expect(t.admitStart(A)).toEqual({ kind: "already" });
     expect(t.admitStart(B).kind).toBe("refused");
@@ -44,6 +52,7 @@ describe("playtest state machine", () => {
     const { t, clock } = tracker();
     t.report("edit", "idle");
     t.beginStart(A, "solo", LIMITS);
+    t.startDelivered();
     clock.now += 31_000;
     t.report("edit", "idle");
     expect(t.snapshot()).toMatchObject({ state: "idle", owner: null });
@@ -69,6 +78,8 @@ describe("playtest state machine", () => {
     t.report("edit", "idle");
     expect(t.admitStop(A, false)).toEqual({ kind: "idle" });
     t.beginStart(A, "server", LIMITS);
+    t.startDelivered();
+    t.startSucceeded();
     t.report("edit", "running", "run");
     expect(t.admitStop(A, false)).toEqual({ kind: "proceed" });
     const other = t.admitStop(B, false);
@@ -79,6 +90,8 @@ describe("playtest state machine", () => {
     const { t, clock } = tracker();
     t.report("edit", "idle");
     t.beginStart(A, "solo", LIMITS);
+    t.startDelivered();
+    t.startSucceeded();
     t.serverPeer(true);
     t.report("server", "running", undefined, 1);
     expect(t.due()).toBeNull();
@@ -96,6 +109,8 @@ describe("playtest state machine", () => {
     const { t, clock } = tracker();
     t.report("edit", "idle");
     t.beginStart(A, "solo", LIMITS);
+    t.startDelivered();
+    t.startSucceeded();
     t.report("edit", "running", "play");
     expect(t.snapshot().warning).toBeNull();
     clock.now += 6_000;
@@ -104,6 +119,16 @@ describe("playtest state machine", () => {
     t.serverPeer(true);
     expect(t.snapshot().warning).toBeNull();
   });
+});
+
+test("a start whose plugin answer is `already` credits the user, not the agent", () => {
+  const { t } = tracker();
+  t.report("edit", "idle");
+  t.beginStart(A, "solo", LIMITS);
+  t.startDelivered();
+  t.report("edit", "running", "play");
+  t.startFailed();
+  expect(t.snapshot()).toMatchObject({ state: "running", owner: null, startedBy: "user" });
 });
 
 describe("stale code", () => {

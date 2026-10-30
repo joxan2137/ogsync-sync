@@ -8,12 +8,13 @@
 // internet requests (updates, docs) keep the user's proxy.
 
 import { spawn } from "node:child_process";
-import { openSync } from "node:fs";
+import { closeSync, openSync } from "node:fs";
 import { request } from "node:http";
 import { BridgeError, CANDIDATE_PORTS, PROTO_VERSION, type BridgeErrorCode } from "../proto/types.ts";
 import { ogsyncHome } from "../config.ts";
 import { log } from "../log.ts";
 import { ensureToken, type IdResponse, type RpcCaller, type RpcResponse } from "../hub/hub.ts";
+import { VERSION } from "../version.ts";
 import { isAlive, logFile, readDaemonRecord } from "./lock.ts";
 
 const PROBE_TIMEOUT_MS = 800;
@@ -98,12 +99,16 @@ export async function probeDaemon(port: number, timeoutMs = PROBE_TIMEOUT_MS): P
   }
 }
 
-/** daemon.json first; a scan of the candidate ports covers a missing or stale record. */
+/**
+ * daemon.json first, trusted only when the daemon on its port answers with the
+ * recorded pid (a pid can be reused); a scan of the candidate ports covers a
+ * missing or stale record.
+ */
 export async function findDaemon(): Promise<DaemonEndpoint | null> {
   const record = readDaemonRecord();
   if (record !== null && isAlive(record.pid)) {
     const identity = await probeDaemon(record.port);
-    if (identity) return { port: record.port, identity };
+    if (identity?.pid === record.pid) return { port: record.port, identity };
   }
   for (const port of CANDIDATE_PORTS) {
     if (port === record?.port) continue;
@@ -113,15 +118,37 @@ export async function findDaemon(): Promise<DaemonEndpoint | null> {
   return null;
 }
 
-/** The running daemon, spawning a detached one when none answers. */
+/** HolderProbe for the daemon lock: does that pid answer GET /id on any candidate port? */
+export async function daemonAnswersAs(pid: number): Promise<boolean> {
+  const record = readDaemonRecord();
+  const ports = record === null ? CANDIDATE_PORTS : [record.port, ...CANDIDATE_PORTS.filter((port) => port !== record.port)];
+  for (const port of ports) {
+    if ((await probeDaemon(port, 300))?.pid === pid) return true;
+  }
+  return false;
+}
+
+/**
+ * The running daemon, spawning a detached one when none answers. An older
+ * protocol daemon is replaced; a newer one is never touched (this client is
+ * the stale side) and answers VERSION.
+ */
 export async function ensureDaemon(opts: { port?: number | null } = {}): Promise<DaemonEndpoint & { spawned: boolean }> {
   const existing = await findDaemon();
   if (existing) {
-    if (existing.identity.proto === PROTO_VERSION) return { ...existing, spawned: false };
-    log.warn(
-      `daemon ${existing.identity.version} on :${existing.port} speaks proto ${existing.identity.proto}, this ogsync speaks ${PROTO_VERSION}; restarting it`,
-    );
+    const theirs = existing.identity.proto;
+    if (theirs === PROTO_VERSION) return { ...existing, spawned: false };
+    if (theirs > PROTO_VERSION) {
+      throw new BridgeError(
+        "VERSION",
+        `the running daemon ${existing.identity.version} speaks proto ${theirs}, this ogsync ${VERSION} speaks proto ${PROTO_VERSION}; run \`ogsync update\` and restart the session`,
+      );
+    }
+    log.warn(`daemon ${existing.identity.version} on :${existing.port} speaks proto ${theirs}, this ogsync speaks ${PROTO_VERSION}; replacing it`);
     await stopDaemon(existing.port);
+    if (!(await waitForExit(existing.identity.pid))) {
+      throw new BridgeError("VERSION", `the proto ${theirs} daemon (pid ${existing.identity.pid}) did not exit; stop it and retry`);
+    }
   }
   spawnDaemon(opts.port ?? null);
   log.info(`starting the ogsync daemon, log: ${logFile()}`);
@@ -132,6 +159,15 @@ export async function ensureDaemon(opts: { port?: number | null } = {}): Promise
     if (started && started.identity.proto === PROTO_VERSION) return { ...started, spawned: true };
   }
   throw new Error(`the ogsync daemon did not come up within ${SPAWN_WAIT_MS / 1000}s; see ${logFile()}`);
+}
+
+async function waitForExit(pid: number): Promise<boolean> {
+  const deadline = Date.now() + SHUTDOWN_WAIT_MS;
+  while (isAlive(pid)) {
+    if (Date.now() >= deadline) return false;
+    await Bun.sleep(SPAWN_POLL_MS);
+  }
+  return true;
 }
 
 export async function stopDaemon(port: number, token?: string): Promise<boolean> {
@@ -177,15 +213,20 @@ function portArgs(port: number | null): string[] {
 function detachedSpawn(argv: string[]): number | undefined {
   const [command, ...args] = selfCommand(argv);
   const out = openSync(logFile(), "a");
-  const child = spawn(command!, args, {
-    cwd: ogsyncHome(),
-    detached: true,
-    stdio: ["ignore", out, out],
-    windowsHide: true,
-    env: withLoopbackNoProxy(process.env),
-  });
-  child.unref();
-  return child.pid;
+  try {
+    const child = spawn(command!, args, {
+      cwd: ogsyncHome(),
+      detached: true,
+      stdio: ["ignore", out, out],
+      windowsHide: true,
+      env: withLoopbackNoProxy(process.env),
+    });
+    child.unref();
+    return child.pid;
+  } finally {
+    // The child holds its own handle; ours would only leak.
+    closeSync(out);
+  }
 }
 
 /**

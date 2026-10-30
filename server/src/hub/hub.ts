@@ -69,6 +69,8 @@ const MAX_TARGET_BRIDGES = 64;
 const BEARER = "Bearer ";
 /** Studio sends this; a browser cannot without a preflight the hub never answers. */
 const PLUGIN_HEADER = "x-ogsync-plugin";
+/** Per-registration secret from the handshake; pull and push without it are unknown sessions. */
+const TOKEN_HEADER = "x-ogsync-token";
 const PLUGIN_ROUTES: ReadonlySet<string> = new Set([
   "POST /handshake",
   "GET /pull",
@@ -110,8 +112,8 @@ export interface RpcCaller {
 export type RpcHandler = (tool: string, args: unknown, caller: RpcCaller) => Promise<unknown>;
 export type AttachHandler = (body: { client?: unknown; cwd?: unknown }) => unknown;
 
+/** Session ids are bearer-like (pull/push key on them) and never leave the daemon. */
 export interface HealthSession {
-  session: string;
   role: Role;
   placeName: string;
   placeId: number;
@@ -127,7 +129,7 @@ export interface HealthResponse {
   version: string;
   proto: number;
   sessions: HealthSession[];
-  /** Session the hub's own default target resolves to, if exactly one. */
+  /** Place key the hub's own default target resolves to, if exactly one. */
   bound: string | null;
   sync: { enabled: boolean; pending: number; conflicts: number };
 }
@@ -157,6 +159,10 @@ interface PollWaiter {
 
 interface Peer {
   info: SessionInfo & { placeKey: string };
+  /** Handshake-issued secret every pull and push must present. */
+  token: string;
+  /** Set while a push is being handled: jobs it unblocks ride back on its response. */
+  pushing: boolean;
   slot: string;
   /** Jobs delivered-but-unacked and not-yet-delivered, in seq order. */
   queue: QueuedJob[];
@@ -191,6 +197,9 @@ interface PendingCall {
   /** Session the job was handed to; null while it waits for admission or a re-attach. */
   session: string | null;
   scheduled: boolean;
+  /** Handed to the plugin (pull or push response); before that a stop may cancel it. */
+  delivered: boolean;
+  onDeliver?: () => void;
   resolve: (data: unknown) => void;
   reject: (err: unknown) => void;
   onPartial?: (data: unknown) => void;
@@ -455,7 +464,6 @@ export class Hub implements Bridge {
       placeId: place.placeId,
       peers: this.peersOf(place.key).map((peer) => ({
         role: peer.info.role,
-        session: peer.info.session,
         pluginVersion: peer.info.pluginVersion,
         ageMs: now - peer.info.lastSeen,
       })),
@@ -469,7 +477,7 @@ export class Hub implements Bridge {
     const caller = currentCaller();
     const admission = place.tracker.admitStart(caller);
     if (admission.kind === "refused") throw new BridgeError("LEASE", admission.reason);
-    if (admission.kind === "already") return { already: true, ...place.tracker.snapshot() };
+    if (admission.kind === "already") return { already: true, yours: true, ...place.tracker.snapshot() };
     const mode = isRecord(args) && typeof args["mode"] === "string" ? args["mode"] : "solo";
     const clients = mode === "solo" ? 1 : 0;
     if (clients > caller.playtest.max_clients) {
@@ -481,7 +489,14 @@ export class Hub implements Bridge {
       pluginGraceMs: caller.playtest.plugin_grace_s * 1000,
     });
     try {
-      return await this.callPlace(place, role, "play.start", args, opts);
+      const data = await this.callPlace(place, role, "play.start", args, opts, () => place.tracker.startDelivered());
+      // Studio was already running a test this call did not start: no credit, no lease.
+      if (isRecord(data) && data["already"] === true) {
+        place.tracker.startFailed();
+        return { ...data, yours: false };
+      }
+      place.tracker.startSucceeded();
+      return data;
     } catch (err) {
       place.tracker.startFailed();
       throw err;
@@ -493,6 +508,14 @@ export class Hub implements Bridge {
     const admission = place.tracker.admitStop(currentCaller(), force);
     if (admission.kind === "refused") throw new BridgeError("LEASE", admission.reason);
     if (admission.kind === "idle") return { stopped: false, state: "idle" };
+    const queuedStart = [...this.calls.values()].find(
+      (call) => call.place === place.key && call.job.op === "play.start" && !call.delivered,
+    );
+    if (queuedStart) {
+      this.failCall(queuedStart.id, new BridgeError("LEASE", "play.start was cancelled by play.stop before it reached Studio"));
+      place.tracker.startFailed();
+      if (place.tracker.snapshot().state === "idle") return { stopped: false, state: "idle", cancelledStart: true };
+    }
     place.tracker.beginStop();
     try {
       return await this.callPlace(place, role, "play.stop", args, opts);
@@ -539,7 +562,14 @@ export class Hub implements Bridge {
 
   // ------------------------------------------------------------- routing and admission
 
-  private callPlace(place: PlaceRecord, role: TargetRole | null, op: OpName, args: unknown, opts: CallOpts): Promise<unknown> {
+  private callPlace(
+    place: PlaceRecord,
+    role: TargetRole | null,
+    op: OpName,
+    args: unknown,
+    opts: CallOpts,
+    onDeliver?: () => void,
+  ): Promise<unknown> {
     const routed = this.route(place, op, args, role);
     const id = crypto.randomUUID();
     const timeoutMs = clampTimeout(opts.timeoutMs);
@@ -556,6 +586,8 @@ export class Hub implements Bridge {
         client: currentCaller().id,
         session: null,
         scheduled: !PRIORITY_OPS.has(op),
+        delivered: false,
+        onDeliver,
         resolve,
         reject,
         onPartial: opts.onPartial,
@@ -659,7 +691,7 @@ export class Hub implements Bridge {
         case "GET /pull":
           return await this.pull(req, url);
         case "POST /push":
-          return this.push(await this.body<PushRequest>(req));
+          return this.push(await this.body<PushRequest>(req), req.headers.get(TOKEN_HEADER));
         case "GET /health":
           return this.json(this.health());
         case "GET /id":
@@ -741,8 +773,18 @@ export class Hub implements Bridge {
 
     const now = Date.now();
     const existing = this.registry.get(req.session);
-    const readopted = existing !== undefined && existing.info.role === req.role && existing.info.placeKey.split("~")[0] === basePlaceKey(req);
-    if (existing && !readopted) this.dropPeer(req.session, "re-handshook as another place or role", "fail");
+    const readopted =
+      existing !== undefined &&
+      typeof req.token === "string" &&
+      req.token === existing.token &&
+      existing.info.role === req.role &&
+      existing.info.placeKey.split("~")[0] === basePlaceKey(req);
+    if (existing && !readopted) {
+      // A fresh registration under a known id (plugin restarted its loop without
+      // the old secret): park the old one's calls for the new one to adopt.
+      const samePlace = existing.info.role === req.role && existing.info.placeKey.split("~")[0] === basePlaceKey(req);
+      this.dropPeer(req.session, "re-registered", samePlace ? "orphan" : "fail");
+    }
     const placeKey = readopted ? existing.info.placeKey : this.assignKey(basePlaceKey(req), req.role, req.session);
     const info: Peer["info"] = {
       session: req.session,
@@ -768,7 +810,16 @@ export class Hub implements Bridge {
       existing.info = info;
       for (const job of pending) if (this.calls.has(job.id)) this.enqueue(existing, job);
     } else {
-      const peer: Peer = { info, slot: slotOf(placeKey, req.role), queue: [], inflight: new Map(), seq: 0, waiter: null };
+      const peer: Peer = {
+        info,
+        token: crypto.randomUUID(),
+        pushing: false,
+        slot: slotOf(placeKey, req.role),
+        queue: [],
+        inflight: new Map(),
+        seq: 0,
+        waiter: null,
+      };
       this.registry.set(req.session, peer);
       this.slots.set(peer.slot, req.session);
       this.adoptOrphans(peer);
@@ -790,6 +841,7 @@ export class Hub implements Bridge {
       syncEnabled: project.syncEnabled,
       projectName: project.name,
       placeKey,
+      token: this.registry.get(req.session)!.token,
     };
   }
 
@@ -843,7 +895,7 @@ export class Hub implements Bridge {
   }
 
   private pull(req: Request, url: URL): Promise<Response> | Response {
-    const peer = this.requireSession(url.searchParams.get("session"));
+    const peer = this.requireSession(url.searchParams.get("session"), req.headers.get(TOKEN_HEADER));
     peer.info.lastSeen = Date.now();
 
     // A cursor beyond our own seq means the plugin kept state across a daemon
@@ -873,12 +925,30 @@ export class Hub implements Bridge {
     });
   }
 
-  private push(body: PushRequest): Response {
-    const peer = this.requireSession(body.session);
+  /**
+   * Settling a result usually admits the place's next call; its job rides back
+   * on this response instead of waking the parked pull, which would cost the
+   * plugin a second request per job against Studio's HttpService budget.
+   */
+  private push(body: PushRequest, token: string | null): Response {
+    const peer = this.requireSession(body.session, token);
     peer.info.lastSeen = Date.now();
-    for (const result of body.results ?? []) this.settle(result, peer);
-    for (const ev of body.events ?? []) this.dispatch(ev, peer);
-    return this.json({ ok: true });
+    peer.pushing = true;
+    try {
+      for (const result of body.results ?? []) this.settle(result, peer);
+      for (const ev of body.events ?? []) this.dispatch(ev, peer);
+    } finally {
+      peer.pushing = false;
+    }
+    if (this.registry.get(peer.info.session) !== peer || peer.queue.length === 0) return this.json({ ok: true });
+    const jobs = peer.queue.map((queued) => queued.job);
+    // Delivered on this response, so acked too: the pull never resends them.
+    for (const queued of peer.queue) {
+      this.markDelivered(queued);
+      peer.inflight.set(queued.job.id, queued.job);
+    }
+    peer.queue = [];
+    return this.json({ ok: true, jobs });
   }
 
   private health(): HealthResponse {
@@ -894,7 +964,6 @@ export class Hub implements Bridge {
       version: this.version,
       proto: PROTO_VERSION,
       sessions: this.sessions().map((info) => ({
-        session: info.session,
         role: info.role,
         placeName: info.placeName,
         placeId: info.placeId,
@@ -902,7 +971,7 @@ export class Hub implements Bridge {
         pluginVersion: info.pluginVersion,
         age: Math.round((now - info.lastSeen) / 1000),
       })),
-      bound: this.bound()?.session ?? null,
+      bound: this.bound()?.placeKey ?? null,
       sync: {
         enabled: status?.enabled ?? this.config.sync.enabled,
         pending: status?.pending ?? 0,
@@ -946,7 +1015,7 @@ export class Hub implements Bridge {
     peer.seq += 1;
     peer.queue.push({ seq: peer.seq, job, delivered: false });
     log.debug(`job ${job.id} ${job.op} → ${short(peer.info.session)} (seq ${peer.seq})`);
-    this.flush(peer);
+    if (!peer.pushing) this.flush(peer);
   }
 
   private flush(peer: Peer): void {
@@ -957,8 +1026,17 @@ export class Hub implements Bridge {
     waiter.resolve(this.jobsResponse(peer));
   }
 
+  private markDelivered(queued: QueuedJob): void {
+    if (queued.delivered) return;
+    queued.delivered = true;
+    const call = this.calls.get(queued.job.id);
+    if (!call || call.delivered) return;
+    call.delivered = true;
+    call.onDeliver?.();
+  }
+
   private jobsResponse(peer: Peer): Response {
-    for (const queued of peer.queue) queued.delivered = true;
+    for (const queued of peer.queue) this.markDelivered(queued);
     const payload: PullResponse = {
       cursor: peer.queue.at(-1)?.seq ?? peer.seq,
       jobs: peer.queue.map((queued) => queued.job),
@@ -1045,9 +1123,13 @@ export class Hub implements Bridge {
     tracker?.report(peer.info.role === "edit" ? "edit" : "server", ev.state, ev.mode, ev.players);
   }
 
-  private requireSession(session: string | null): Peer {
+  private requireSession(session: string | null, token: string | null): Peer {
     const peer = session === null ? undefined : this.registry.get(session);
-    if (!peer) throw new HttpError(409, "NOSESSION", "unknown session, handshake first");
+    // A wrong secret reads exactly like an unknown session: re-handshake. That
+    // also makes a goodbye from an older registration a no-op.
+    if (!peer || token === null || token !== peer.token) {
+      throw new HttpError(409, "NOSESSION", "unknown session, handshake first");
+    }
     return peer;
   }
 

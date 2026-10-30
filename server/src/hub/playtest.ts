@@ -53,7 +53,12 @@ export class PlaytestTracker {
   #serverPresent = false;
   #heartbeat: number | null = null;
   #lease: Lease | null = null;
+  /** play.start admitted but still queued: "starting", with no timeout of its own (the call has one). */
+  #startQueued = false;
+  /** Set when play.start reaches the plugin; the start timeout counts from here. */
   #startingAt: number | null = null;
+  /** The plugin answered that this start launched the test (not `already`). */
+  #startConfirmed = false;
   #stoppingAt: number | null = null;
   #startedBy: "agent" | "user" | null = null;
   #phase: PlaytestPhase = "unknown";
@@ -102,15 +107,33 @@ export class PlaytestTracker {
 
   beginStart(caller: { id: string; label?: string }, mode: string, limits: LeaseLimits): void {
     this.#lease = { owner: caller.id, label: caller.label, mode, limits, runningAt: null };
-    this.#startingAt = this.#now();
+    this.#startQueued = true;
+    this.#startingAt = null;
+    this.#startConfirmed = false;
     this.#warning = null;
     this.#refresh();
   }
 
+  startDelivered(): void {
+    if (!this.#startQueued) return;
+    this.#startQueued = false;
+    this.#startingAt = this.#now();
+    this.#refresh();
+  }
+
+  /** The plugin says this start launched the test: the agent gets the credit. */
+  startSucceeded(): void {
+    this.#startConfirmed = true;
+    if (this.#refresh() === "running") this.#creditAgent(this.#now());
+  }
+
+  /** Failed, cancelled, or the plugin found a test already running: no lease. */
   startFailed(): void {
     this.#lease = null;
+    this.#startQueued = false;
     this.#startingAt = null;
-    this.#refresh();
+    this.#startConfirmed = false;
+    if (this.#refresh() === "running" && this.#startedBy === null) this.#startedBy = "user";
   }
 
   admitStop(caller: { id: string }, force: boolean): StopAdmission {
@@ -210,27 +233,31 @@ export class PlaytestTracker {
     const running = this.#isRunning();
     if (this.#stoppingAt !== null && (running || editState === "stopping")) return "stopping";
     if (running) return "running";
-    if (editState === "starting" || this.#startingAt !== null) return "starting";
+    if (editState === "starting" || this.#startingAt !== null || this.#startQueued) return "starting";
     if (editState === "stopping") return "stopping";
     return "idle";
   }
 
   #enterRunning(now: number): void {
     this.#runningSince = now;
-    if (this.#startingAt !== null && this.#lease !== null) {
-      this.#startedBy = "agent";
-      this.#lease.runningAt = now;
-    } else if (this.#lease === null) {
-      this.#startedBy = "user";
-    }
+    if (this.#lease === null) this.#startedBy = "user";
+    else if (this.#startConfirmed) this.#creditAgent(now);
+    // Otherwise the start's own result decides: startSucceeded or startFailed.
     this.#startingAt = null;
+  }
+
+  #creditAgent(now: number): void {
+    this.#startedBy = "agent";
+    if (this.#lease !== null) this.#lease.runningAt ??= now;
   }
 
   #enterIdle(): void {
     const warning = this.#warning;
     this.#lease = null;
     this.#startedBy = null;
+    this.#startQueued = false;
     this.#startingAt = null;
+    this.#startConfirmed = false;
     this.#stoppingAt = null;
     this.#runningSince = null;
     this.#stale = null;

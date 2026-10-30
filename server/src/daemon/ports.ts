@@ -50,6 +50,11 @@ export function isExcluded(port: number, ranges: readonly PortRange[]): boolean 
  * daemon.port), then the candidate list; excluded ones dropped.
  */
 export function portCandidates(preferred: number | null, ranges: readonly PortRange[]): number[] {
+  if (preferred !== null && !CANDIDATE_PORTS.includes(preferred)) {
+    log.warn(
+      `port ${preferred} is not one the plugin scans (${CANDIDATE_PORTS.join(", ")}); Studio finds the daemon there only if its OGSync panel is set to ${preferred}`,
+    );
+  }
   const ordered = preferred === null ? [...CANDIDATE_PORTS] : [preferred, ...CANDIDATE_PORTS];
   const usable = [...new Set(ordered)].filter((port) => !isExcluded(port, ranges));
   const dropped = ordered.filter((port) => isExcluded(port, ranges));

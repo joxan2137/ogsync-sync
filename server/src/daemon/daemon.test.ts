@@ -1,5 +1,5 @@
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
@@ -59,21 +59,62 @@ describe("ports", () => {
 });
 
 describe("single-instance lock", () => {
-  test("a live holder blocks a second daemon; a dead one is taken over", () => {
-    const first = acquireLock();
-    expect(first).not.toBeNull();
-    expect(acquireLock(process.pid + 1)).toBeNull();
+  const OLD = new Date(Date.now() - 60_000);
+  const answering = async () => true;
+  const silent = async () => false;
+  // The other process: the test runner's parent is alive and is not us.
+  const otherLivePid = process.ppid;
+
+  function staleLock(content: string): void {
+    writeFileSync(lockFile(), content);
+    utimesSync(lockFile(), OLD, OLD);
+  }
+
+  test("a young lock blocks a second daemon whatever its pid", async () => {
+    const first = await acquireLock(silent);
+    expect(first?.held()).toBe(true);
+    expect(await acquireLock(silent, otherLivePid)).toBeNull();
     first!.release();
     expect(existsSync(lockFile())).toBe(false);
+  });
 
-    writeFileSync(lockFile(), "2147483646"); // no such process
-    const takeover = acquireLock();
-    expect(takeover).not.toBeNull();
+  test("an empty lock reads as live while young and stale once old", async () => {
+    writeFileSync(lockFile(), "");
+    expect(await acquireLock(silent)).toBeNull();
+    utimesSync(lockFile(), OLD, OLD);
+    const takeover = await acquireLock(silent);
+    expect(takeover?.held()).toBe(true);
     takeover!.release();
   });
 
-  test("daemon.json round-trips and is removed with the lock", () => {
-    const lock = acquireLock()!;
+  test("an old lock is live only if its pid is alive and answers /id as that pid", async () => {
+    staleLock(JSON.stringify({ pid: otherLivePid, nonce: "n", at: OLD.getTime() }));
+    expect(await acquireLock(answering)).toBeNull();
+    const reused = await acquireLock(silent); // live pid, but not a daemon: reused
+    expect(reused?.held()).toBe(true);
+    reused!.release();
+
+    staleLock("2147483646"); // pre-nonce format, no such process
+    const dead = await acquireLock(answering);
+    expect(dead?.held()).toBe(true);
+    dead!.release();
+  });
+
+  test("a holder whose lock was taken over no longer holds it", async () => {
+    const first = await acquireLock(silent);
+    utimesSync(lockFile(), OLD, OLD);
+    writeFileSync(lockFile(), JSON.stringify({ pid: 2147483646, nonce: "x", at: OLD.getTime() }));
+    utimesSync(lockFile(), OLD, OLD);
+    const second = await acquireLock(silent, otherLivePid);
+    expect(second?.held()).toBe(true);
+    expect(first!.held()).toBe(false);
+    first!.release(); // must not remove the new owner's lock
+    expect(existsSync(lockFile())).toBe(true);
+    second!.release();
+  });
+
+  test("daemon.json round-trips and is removed with the lock", async () => {
+    const lock = (await acquireLock(silent))!;
     writeDaemonRecord({ pid: process.pid, port: 3668, version: "9.9.9", proto: PROTO_VERSION, startedAt: 1 });
     expect(readDaemonRecord()).toEqual({ pid: process.pid, port: 3668, version: "9.9.9", proto: PROTO_VERSION, startedAt: 1 });
     lock.release();
@@ -163,7 +204,7 @@ describe("status", () => {
             key: "111",
             name: "Main",
             placeId: 111,
-            peers: [{ role: "edit", session: "s", pluginVersion: "1.0.0", ageMs: 2_000 }],
+            peers: [{ role: "edit", pluginVersion: "1.0.0", ageMs: 2_000 }],
             playtest: {
               state: "running",
               mode: "play",

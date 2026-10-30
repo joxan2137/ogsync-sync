@@ -24,10 +24,16 @@ function JobLog.begin(log: JobLog, id: string): string
 	end
 	log.done[id] = false
 	table.insert(log.order, id)
-	while #log.order > log.capacity do
-		local evicted = table.remove(log.order, 1)
-		if evicted ~= nil then
-			log.done[evicted] = nil
+	-- Only finished ids age out: forgetting a running one would let its
+	-- redelivery start the op a second time.
+	local index = 1
+	while #log.order > log.capacity and index <= #log.order do
+		local candidate = log.order[index]
+		if log.done[candidate] then
+			table.remove(log.order, index)
+			log.done[candidate] = nil
+		else
+			index += 1
 		end
 	end
 	return "new"

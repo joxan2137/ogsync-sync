@@ -8,8 +8,13 @@ const DEFAULT_WAIT_MS = 30_000;
 const MAX_WAIT_MS = 300_000;
 /** Log and playtest checks read daemon state; this only bounds reaction time. */
 const LOCAL_POLL_MS = 200;
-/** Attribute/instance checks cost a Studio round trip each, so they space out. */
-const STUDIO_POLL_MS = 500;
+/**
+ * Attribute/instance checks cost a Studio round trip each, against Studio's
+ * HttpService request budget: start quick, then back off to a slow trickle.
+ */
+const STUDIO_POLL_MIN_MS = 500;
+const STUDIO_POLL_MAX_MS = 4_000;
+const STUDIO_POLL_GROWTH = 1.5;
 const CHECK_TIMEOUT_MS = 10_000;
 const MATCH_LIMIT = 20;
 
@@ -90,6 +95,7 @@ async function waitPlaytest(bridge: Bridge, state: PlaytestPhase, deadline: numb
 
 async function waitStudio(bridge: Bridge, check: Record<string, unknown>, deadline: number): Promise<string> {
   let last: CheckResult = {};
+  let interval = STUDIO_POLL_MIN_MS;
   for (;;) {
     const remaining = Math.max(1_000, Math.min(CHECK_TIMEOUT_MS, deadline - Date.now()));
     last = (await bridge.call("wait.check", check, { timeoutMs: remaining })) as CheckResult;
@@ -101,6 +107,7 @@ async function waitStudio(bridge: Bridge, check: Record<string, unknown>, deadli
       const seen = last.exists === false ? "instance missing" : `last value ${fmtValue(last.value)}`;
       throw new BridgeError("TIMEOUT", `${check["kind"]} condition on ${check["path"]} not met (${seen})`);
     }
-    await Bun.sleep(STUDIO_POLL_MS);
+    await Bun.sleep(Math.min(interval, Math.max(0, deadline - Date.now())));
+    interval = Math.min(STUDIO_POLL_MAX_MS, interval * STUDIO_POLL_GROWTH);
   }
 }
