@@ -709,7 +709,11 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 function placeKey(place: { placeId: number; placeName: string }): string {
-  return `${place.placeId}:${place.placeName.toLowerCase()}`;
+  // Play/Run DataModels rename themselves ("Name @ 02 Aug 2026 15:49"), so the
+  // id is the only stable key; unsaved places (placeId 0) fall back to the
+  // name with that suffix stripped.
+  if (place.placeId > 0) return String(place.placeId);
+  return place.placeName.replace(/ @ .*$/, "").toLowerCase();
 }
 
 function describePlace(place: { placeId: number; placeName: string }): string {
