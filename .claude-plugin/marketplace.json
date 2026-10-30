@@ -1,0 +1,18 @@
+{
+  "name": "ogsync",
+  "owner": {
+    "name": "joxan"
+  },
+  "metadata": {
+    "description": "OGSync: Roblox Studio tooling for Claude Code"
+  },
+  "plugins": [
+    {
+      "name": "ogsync",
+      "source": "./claude-plugin",
+      "description": "Roblox Studio for Claude Code: the OGSync MCP server, a playtest edit guard, and notices when Studio overwrites an agent's edit",
+      "version": "0.1.0",
+      "category": "development"
+    }
+  ]
+}
