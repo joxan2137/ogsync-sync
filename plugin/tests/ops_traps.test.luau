@@ -196,6 +196,29 @@ end
 
 -- ------------------------------------------------------------------ recording
 
+-- ------------------------------------------------------------------ paths
+
+local function testLocalPlayerPath()
+	local env = newEnv()
+	local Path = env.load("Util/Path")
+	local players = env.game:GetService("Players")
+	local player = env.newInstance("Player", "Player1", players)
+	local gui = env.newInstance("Folder", "PlayerGui", player)
+	local shop = env.newInstance("Folder", "Shop", gui)
+
+	local missing, why = Path.resolve("game.Players.LocalPlayer.PlayerGui.Shop")
+	check("LocalPlayer outside a client does not resolve", missing == nil)
+	check("the miss explains LocalPlayer is client-only", why ~= nil and string.find(why, "client context", 1, true) ~= nil, why)
+
+	rawset(players, "LocalPlayer", player)
+	check("LocalPlayer resolves to the client's player", Path.resolve("game.Players.LocalPlayer.PlayerGui.Shop") == shop)
+	check("a child literally named LocalPlayer still wins", (function()
+		local named = env.newInstance("Folder", "LocalPlayer", players)
+		return Path.resolve("game.Players.LocalPlayer") == named
+	end)())
+	check("by-name paths keep working", Path.resolve("game.Players.Player1.PlayerGui") == gui)
+end
+
 local function testRecording()
 	local env = newEnv()
 	local history = env.game:GetService("ChangeHistoryService")
@@ -323,6 +346,7 @@ testSourceWrite()
 testScriptOps()
 testJobs()
 testRecording()
+testLocalPlayerPath()
 testTransform()
 
 print(`ops traps: {passed} passed, {failed} failed`)

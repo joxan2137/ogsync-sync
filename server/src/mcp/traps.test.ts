@@ -2,8 +2,10 @@ import { describe, expect, test } from "bun:test";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
-import type { Bridge, OpName } from "@proto/types";
+import { BridgeError, type Bridge, type OpName } from "@proto/types";
 import { createMcpServer } from "./server.ts";
+import { isBlackFrame } from "./tools/screenshot.ts";
+import { checkTimeoutMs } from "./tools/wait.ts";
 
 interface Call {
   op: OpName;
@@ -188,20 +190,47 @@ describe("place edits", () => {
 });
 
 describe("visual tools", () => {
-  test("screenshot reports scale, inset and capture warnings", async () => {
+  test("edit screenshot reports scale, inset and capture warnings in one step", async () => {
     const { bridge, calls } = recordingBridge(() => ({
       w: 1,
       h: 1,
-      rgba: Buffer.from([1, 2, 3, 255]).toString("base64"),
+      rgba: Buffer.from([90, 120, 200, 255]).toString("base64"),
       scale: 0.5,
       viewport: { w: 1920, h: 1080 },
       inset: { x: 0, y: 58 },
       warnings: ["2 AlwaysOnTop BillboardGui/SurfaceGui present; CaptureService captures can omit them"],
     }));
-    const text = await call(bridge, "screenshot", { context: "client", frame: "game.Workspace.Hut", hide_ui: true });
-    expect(text).toMatch(/^client 1x1 png \d+B\tviewport=1920x1080 scale=0\.5 inset=0,58\n/);
+    const text = await call(bridge, "screenshot", { frame: "game.Workspace.Hut", hide_ui: true });
+    expect(text).toMatch(/^edit 1x1 png \d+B\tviewport=1920x1080 scale=0\.5 inset=0,58\n/);
     expect(text).toEndWith("warn: 2 AlwaysOnTop BillboardGui/SurfaceGui present; CaptureService captures can omit them");
-    expect(calls[0]!.args).toMatchObject({ context: "client", frame: "game.Workspace.Hut", hide_ui: true });
+    expect(calls.map((c) => c.op)).toEqual(["shot.capture"]);
+    expect(calls[0]!.args).toMatchObject({ context: "edit", frame: "game.Workspace.Hut", hide_ui: true, content_only: false });
+  });
+
+  test("client screenshot captures on the client and reads the pixels in edit", async () => {
+    const { bridge, calls } = recordingBridge((op) =>
+      op === "shot.capture"
+        ? { contentId: "rbxtemp://42", viewport: { w: 1920, h: 1080 }, inset: { x: 0, y: 58 }, warnings: [] }
+        : { w: 960, h: 540, rgba: Buffer.alloc(960 * 540 * 4, 200).toString("base64") },
+    );
+    const text = await call(bridge, "screenshot", { context: "client", size: "960x540" });
+    expect(text).toMatch(/^client 960x540 png \d+B\tviewport=1920x1080 scale=0\.5 inset=0,58$/);
+    expect(calls.map((c) => c.op)).toEqual(["shot.capture", "shot.read"]);
+    expect(calls[0]!.args).toMatchObject({ context: "client", content_only: true });
+    expect(calls[1]!.args).toEqual({ contentId: "rbxtemp://42", size: "960x540" });
+  });
+
+  test("a fully black capture is flagged", async () => {
+    expect(isBlackFrame(Buffer.from([0, 0, 0, 255, 3, 8, 1, 255]))).toBe(true);
+    expect(isBlackFrame(Buffer.from([0, 0, 0, 255, 0, 40, 0, 255]))).toBe(false);
+    const { bridge } = recordingBridge(() => ({ w: 1, h: 1, rgba: Buffer.from([0, 0, 0, 255]).toString("base64") }));
+    expect(await call(bridge, "screenshot", {})).toContain("warn: capture is a fully black frame");
+  });
+
+  test("input text types through the virtual input path", async () => {
+    const { bridge, calls } = recordingBridge(() => ({ actions: [{ type: "text", ok: true, chars: 5 }] }));
+    expect(await call(bridge, "input", { actions: [{ type: "text", text: "hello" }] })).toBe("1 text ok\tchars=5");
+    expect(calls[0]!.args).toMatchObject({ actions: [{ type: "text", text: "hello" }], context: "client" });
   });
 
   test("input click by path goes to the client and reports the hit", async () => {
@@ -225,5 +254,54 @@ describe("visual tools", () => {
     const { bridge } = recordingBridge(() => ({}));
     const text = await call(bridge, "input", { actions: [{ type: "click", x: 5 }] });
     expect(text).toBe("ERR BADARG: click needs path or both x and y");
+  });
+});
+
+describe("wait checks", () => {
+  test("client checks get a timeout that fits the broker relay", () => {
+    expect(checkTimeoutMs("client", 1_000)).toBe(5_000);
+    expect(checkTimeoutMs("edit", 1_000)).toBe(1_000);
+    expect(checkTimeoutMs("client", 60_000)).toBe(10_000);
+  });
+
+  test("a timed-out check is not-yet; the wait keeps going and routes by context", async () => {
+    let checks = 0;
+    const { bridge, calls } = recordingBridge(() => {
+      checks += 1;
+      if (checks === 1) throw new BridgeError("TIMEOUT", "wait.check not answered in 5000ms");
+      return { met: true, exists: true };
+    });
+    const text = await call(bridge, "wait", {
+      for: "instance",
+      path: "game.Players.LocalPlayer.PlayerGui.Shop",
+      context: "client",
+      player: "Player1",
+      timeoutMs: 5_000,
+    });
+    expect(text).toBe("wait ok: instance game.Players.LocalPlayer.PlayerGui.Shop");
+    expect(calls[0]!.args).toMatchObject({ kind: "instance", context: "client", player: "Player1" });
+    expect(calls[0]!.timeoutMs).toBe(5_000);
+  });
+
+  test("a wait whose checks all time out ends at its own deadline and says so", async () => {
+    const { bridge } = recordingBridge(() => {
+      throw new BridgeError("TIMEOUT", "slow");
+    });
+    const text = await call(bridge, "wait", { for: "instance", path: "game.X", timeoutMs: 300 });
+    expect(text).toBe("ERR TIMEOUT: instance condition on game.X not met (last check timed out)");
+  });
+
+  test("other check failures still end the wait at once", async () => {
+    const { bridge } = recordingBridge(() => {
+      throw new BridgeError("NOPLUGIN", "no play-mode session");
+    });
+    expect(await call(bridge, "wait", { for: "instance", path: "game.X", context: "server" })).toBe(
+      "ERR NOPLUGIN: no play-mode session",
+    );
+  });
+
+  test("context=all is only for log waits", async () => {
+    const { bridge } = recordingBridge(() => ({}));
+    expect(await call(bridge, "wait", { for: "instance", path: "game.X", context: "all" })).toStartWith("ERR BADARG");
   });
 });

@@ -122,6 +122,7 @@ export const OP_NAMES = [
   "run.job", "script.stage", "inst.transform",
   "play.hashes",
   "wait.check",
+  "shot.read",
 ] as const;
 export type OpName = (typeof OP_NAMES)[number];
 

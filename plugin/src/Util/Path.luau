@@ -4,6 +4,8 @@
 
 local Path = {}
 
+local LOCAL_PLAYER = "LocalPlayer"
+
 local SERVICE_NAMES = {
 	"Workspace", "Players", "Lighting", "ReplicatedFirst", "ReplicatedStorage",
 	"ServerScriptService", "ServerStorage", "StarterGui", "StarterPack",
@@ -154,6 +156,16 @@ local function childOf(parent: Instance, name: string): Instance?
 			return service
 		end
 	end
+	-- `game.Players.LocalPlayer.PlayerGui…` names the client's own player without
+	-- knowing its name; it resolves only where LocalPlayer exists (a client).
+	if name == LOCAL_PLAYER and parent.ClassName == "Players" then
+		local ok, player = pcall(function(): Instance?
+			return (parent :: any).LocalPlayer
+		end)
+		if ok then
+			return player
+		end
+	end
 	return nil
 end
 
@@ -211,7 +223,8 @@ function Path.resolveMulti(path: string): ({Instance}, string?)
 		end
 	end
 	if #resolved == 0 then
-		return {}, string.format("no instance at '%s'", trimmed)
+		local hint = if table.find(segments, LOCAL_PLAYER) then " (LocalPlayer exists only in a client context)" else ""
+		return {}, string.format("no instance at '%s'%s", trimmed, hint)
 	end
 	return resolved, nil
 end

@@ -286,13 +286,15 @@ local function editableImage(contentId: string): any
 			return (AssetService :: any):CreateEditableImageAsync(contentId)
 		end,
 	}
+	local lastErr: any = nil
 	for _, attempt in attempts do
 		local ok, image = pcall(attempt)
 		if ok and image then
 			return image
 		end
+		lastErr = image
 	end
-	error("screenshot unsupported: AssetService:CreateEditableImageAsync")
+	error("screenshot unsupported: AssetService:CreateEditableImageAsync (" .. tostring(lastErr) .. ")")
 end
 
 local function pixelReader(image: any, width: number, height: number): (number, number) -> (number, number, number, number)
@@ -395,8 +397,8 @@ local function readImage(args: any, image: any): any
 end
 
 -- EditableImages hold engine memory until destroyed, so every path frees it.
-local function capture(args: any, timeout: number): any
-	local image = editableImage(captureContentId(timeout))
+local function readContent(args: any, contentId: string): any
+	local image = editableImage(contentId)
 	local ok, result = pcall(readImage, args, image)
 	pcall(function()
 		image:Destroy()
@@ -405,6 +407,18 @@ local function capture(args: any, timeout: number): any
 		error(result, 0)
 	end
 	return result
+end
+
+-- A play DataModel may capture but not promote the temporary texture to an
+-- EditableImage ("cannot create editable image from temporary texture id"),
+-- so play captures stop at the content id and the edit DataModel, which may,
+-- reads the pixels through shot.read.
+local function capture(args: any, timeout: number): any
+	local contentId = captureContentId(timeout)
+	if args.content_only == true then
+		return { contentId = contentId }
+	end
+	return readContent(args, contentId)
 end
 
 return function(register: Register)
@@ -455,8 +469,15 @@ return function(register: Register)
 		result.inset = { x = inset.X, y = inset.Y }
 		-- Output pixels per viewport (input) pixel: divide an image coordinate by
 		-- this to get the x/y an `input` click expects.
-		result.scale = if viewport.X > 0 then result.w / viewport.X else nil
+		result.scale = if viewport.X > 0 and result.w ~= nil then result.w / viewport.X else nil
 		result.warnings = warnings
 		return result
+	end)
+
+	register("shot.read", function(args: any): any
+		if type(args.contentId) ~= "string" then
+			error("shot.read needs the contentId a play-context shot.capture returned")
+		end
+		return readContent(args, args.contentId)
 	end)
 end

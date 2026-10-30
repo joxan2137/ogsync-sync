@@ -29,9 +29,9 @@ plugin/src/
   Ops/Run/Bridge.luau     ops   game-VM eval host — cloned into the play DataModel (run mode: Workspace.Terrain of the edit DataModel, non-archivable, removed when the run ends), never required by the plugin
   Ops/Play.luau           core  play.start/stop/status/hashes
   Ops/Log.luau            ops   log.tail + log event forwarding
-  Ops/Shot.luau           ops   shot.capture
+  Ops/Shot.luau           ops   shot.capture + shot.read (edit reads play captures)
   Ops/Prof.luau           ops   prof.micro/script/memory
-  Ops/Input.luau          ops   input.batch (incl. nav)
+  Ops/Input.luau          ops   input.batch via UserInputService:CreateVirtualInput (incl. nav)
   Ops/Asset.luau          ops   asset.op
   Ops/Rbxm.luau           ops   rbxm.export/import (base64 payloads)
   Ops/Hist.luau           ops   hist.op (undo/redo/waypoint)
@@ -183,7 +183,14 @@ PlayState.onChange(fn): () -> ()
   `frame` and `hide_ui` register restore functions that run (pcall'd, in
   reverse) after the capture whether it succeeded or not. The capture callback
   wait is short (default 4 s) and its timeout error names the cause: the
-  viewport is not painting.
+  viewport is not painting. In a play DataModel `CreateEditableImageAsync`
+  refuses temporary texture ids, so play captures pass `content_only` and stop
+  at the content id; `shot.read` in the edit DataModel reads the pixels.
+- **input.batch**: all simulated input goes through one cached
+  `UserInputService:CreateVirtualInput()` object (SendKey, SendMouseButton,
+  SendMousePosition, SendPointerAction for the wheel, SendTextInput);
+  `VirtualInputManager` is a fallback only, since its Send*Event methods need
+  RobloxScript capability. Coordinates are viewport pixels, inset included.
 - **JSON safety**: results must be JSONEncodable — Serde.encode everything;
   `nil`s in arrays forbidden (use false/omit).
 - **No busy loops**: all polling via `task.wait`, heartbeat-driven; Net pull

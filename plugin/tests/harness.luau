@@ -22,6 +22,8 @@ local ANCESTRY: { [string]: { string } } = {
 	ModuleScript = { "ModuleScript", "LuaSourceContainer", "Instance" },
 	Part = { "Part", "BasePart", "Instance" },
 	Model = { "Model", "PVInstance", "Instance" },
+	Players = { "Players", "Instance" },
+	Player = { "Player", "Instance" },
 }
 
 local SERVICE_CLASS: { [string]: string } = {
@@ -34,6 +36,7 @@ local SERVICE_CLASS: { [string]: string } = {
 	StarterPlayer = "Folder",
 	Workspace = "Folder",
 	ChangeHistoryService = "Instance",
+	Players = "Players",
 }
 
 local function findSourceDir(): string

@@ -15,10 +15,11 @@ interface InputResult {
 }
 
 /** Actions that go through the viewport and so need Studio painting. */
-const VISUAL_ACTIONS: ReadonlySet<string> = new Set(["key", "click", "move", "scroll"]);
+const VISUAL_ACTIONS: ReadonlySet<string> = new Set(["key", "text", "click", "move", "scroll"]);
 
 const action = z.discriminatedUnion("type", [
   z.object({ type: z.literal("key"), code: z.string(), hold_ms: z.number().int().min(0).optional() }),
+  z.object({ type: z.literal("text"), text: z.string() }),
   z.object({
     type: z.literal("click"),
     path: z.string().optional(),
@@ -45,7 +46,7 @@ const action = z.discriminatedUnion("type", [
 export const tool = defineTool({
   name: "input",
   description:
-    "Send a batch of simulated inputs to a playtest (context=client by default): key {code,hold_ms}, click {path | x,y, button} where path resolves a GuiObject or part to screen coordinates at runtime and the ack reports what was hit, move, scroll, nav {to: path|[x,y,z]} which walks the character, device and network. Refuses fast when Studio cannot paint (restore=true un-minimizes without taking focus) and answers `unsupported` with the reason instead of acking input that cannot land.",
+    "Send a batch of simulated inputs to a playtest (context=client by default): key {code,hold_ms}, text {text} (types into the focused TextBox), click {path | x,y, button} where path resolves a GuiObject or part to screen coordinates at runtime and the ack reports what was hit, move, scroll, nav {to: path|[x,y,z]} which walks the character, device and network. Refuses fast when Studio cannot paint (restore=true un-minimizes without taking focus) and answers `unsupported` with the reason instead of acking input that cannot land.",
   schema: {
     actions: z.array(action).min(1),
     context: z.enum(["edit", "server", "client"]).optional(),

@@ -81,14 +81,18 @@ const OPEN_ROUTES: ReadonlySet<string> = new Set(["GET /health", "GET /id", "GET
 /** Ops whose args select a play-mode context; those go to the play-server session. */
 const RUNTIME_CONTEXT_OPS: ReadonlySet<OpName> = new Set<OpName>([
   "run.exec", "log.tail",
-  "run.job", "input.batch", "shot.capture",
+  "run.job", "input.batch", "shot.capture", "wait.check",
 ]);
 /**
  * Never wait behind the place queue: stopping must work while Studio is busy
  * with something else, and run.job collect is a wait (up to wait_ms) on an
  * eval that already runs, which would otherwise hold the queue the whole time.
+ * wait.check is a read-only probe whose condition is often produced by the very
+ * op holding the queue (a running eval creating the awaited instance).
  */
-const PRIORITY_OPS: ReadonlySet<OpName> = new Set<OpName>(["play.stop", "play.stopSignal", "play.status", "run.job"]);
+const PRIORITY_OPS: ReadonlySet<OpName> = new Set<OpName>([
+  "play.stop", "play.stopSignal", "play.status", "run.job", "wait.check",
+]);
 
 const PLUGIN_ERROR_CODES = ["NOPLUGIN", "TIMEOUT", "NOPATH", "BADARG", "STUDIO"] as const satisfies readonly BridgeErrorCode[];
 

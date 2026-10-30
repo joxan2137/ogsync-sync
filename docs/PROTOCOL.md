@@ -354,8 +354,16 @@ in edit mode so Undo can restore it.
 - `shot.capture {target, context, player?, frame?, camera_focus?, hide_ui?, size,
   capture_timeout_ms?}` → `{w, h, rgba, source: {w, h}, stride, viewport: {w, h},
   inset: {x, y}, scale, warnings: [string]}`. `scale = w / viewport.w`.
+  `content_only: true` (used for play contexts) stops after the capture and
+  answers `{contentId, viewport, inset, warnings}`.
+- `shot.read {contentId, size}` → `{w, h, rgba, source, stride}`; sent to the
+  edit session, which can promote a temporary texture captured in a play
+  DataModel to an EditableImage (the play DataModel cannot).
+- `wait.check {kind, path, name?, value?, context, player?}` routes like the
+  other runtime-context ops and skips the place queue.
 - `input.batch {actions, context, player?}`; click acks add `x, y, hit, layer,
-  reached?, activated?`. Unsupported input is an ack with `ok: false, err:
+  reached?, activated?`; `text` acks add `chars`. Input uses
+  `UserInputService:CreateVirtualInput()`. Unsupported input is an ack with `ok: false, err:
   "… unsupported: <reason>"`.
 
 ## Play-mode specifics

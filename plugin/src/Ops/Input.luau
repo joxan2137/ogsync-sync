@@ -1,11 +1,19 @@
 --!strict
--- input.batch: VirtualInputManager key/click/move/scroll plus Humanoid pathfinding nav; device/network emulation is Studio-UI only.
+-- input.batch: key/click/move/scroll/text through UserInputService:CreateVirtualInput()
+-- plus Humanoid pathfinding nav; device/network emulation is Studio-UI only.
 -- Clicks resolve their target at runtime and report what they actually hit.
+--
+-- VirtualInputManager's Send*Event methods need RobloxScript capability, which
+-- no plugin has in any DataModel, so they are only a fallback for a Studio that
+-- lacks CreateVirtualInput. The virtual input object drives the real input
+-- pipeline (UserInputService events, control modules, GUI activation); its
+-- coordinates are viewport pixels, top-bar inset included.
 
 local GuiService = game:GetService("GuiService")
 local PathfindingService = game:GetService("PathfindingService")
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
 local Workspace = game:GetService("Workspace")
 
 local Src = script.Parent.Parent :: any
@@ -21,14 +29,94 @@ local NAV_WAYPOINT_TIMEOUT_S = 5
 local lastMouseX = 0
 local lastMouseY = 0
 
-local function virtualInput(): any
-	local ok, service = pcall(function()
+type Backend = {
+	name: string,
+	key: (down: boolean, code: Enum.KeyCode) -> (),
+	button: (x: number, y: number, button: number, down: boolean) -> (),
+	move: (x: number, y: number) -> (),
+	wheel: (x: number, y: number, delta: number) -> (),
+	text: ((text: string) -> ())?,
+}
+
+local MOUSE_BUTTONS = {
+	[0] = Enum.UserInputType.MouseButton1,
+	[1] = Enum.UserInputType.MouseButton2,
+	[2] = Enum.UserInputType.MouseButton3,
+}
+
+-- One virtual input source per plugin load, so a key held in one batch and
+-- released in a later one belongs to the same device.
+local backend: Backend? = nil
+
+local function fromVirtualInput(vi: any): Backend
+	return {
+		name = "UserInputService:CreateVirtualInput",
+		key = function(down, code)
+			vi:SendKey(down, code)
+		end,
+		button = function(x, y, index, down)
+			vi:SendMouseButton(Vector2.new(x, y), MOUSE_BUTTONS[index] or Enum.UserInputType.MouseButton1, down)
+		end,
+		move = function(x, y)
+			vi:SendMousePosition(Vector2.new(x, y))
+		end,
+		wheel = function(x, y, delta)
+			vi:SendPointerAction(Vector2.new(x, y), { Wheel = delta })
+		end,
+		text = function(text)
+			vi:SendTextInput(text)
+		end,
+	}
+end
+
+local function fromVirtualInputManager(vim: any): Backend
+	return {
+		name = "VirtualInputManager",
+		key = function(down, code)
+			vim:SendKeyEvent(down, code, false, game)
+		end,
+		button = function(x, y, index, down)
+			vim:SendMouseButtonEvent(x, y, index, down, game, 0)
+		end,
+		move = function(x, y)
+			vim:SendMouseMoveEvent(x, y, game)
+		end,
+		wheel = function(x, y, delta)
+			for _ = 1, math.min(math.abs(math.floor(delta)), 32) do
+				vim:SendMouseWheelEvent(x, y, delta > 0, game)
+			end
+		end,
+		text = nil,
+	}
+end
+
+local function virtualInput(): Backend
+	local cached = backend
+	if cached ~= nil then
+		return cached
+	end
+	local ok, vi = pcall(function(): any
+		return (UserInputService :: any):CreateVirtualInput()
+	end)
+	if ok and vi ~= nil then
+		local created = fromVirtualInput(vi)
+		backend = created
+		return created
+	end
+	local vimOk, vim = pcall(function()
 		return game:GetService("VirtualInputManager")
 	end)
-	if not ok or not service then
-		error("input unsupported: VirtualInputManager is not available in this session")
+	if vimOk and vim ~= nil then
+		local created = fromVirtualInputManager(vim)
+		backend = created
+		return created
 	end
-	return service
+	error(
+		"input unsupported: neither UserInputService:CreateVirtualInput() ("
+			.. tostring(vi)
+			.. ") nor VirtualInputManager is available in this session",
+		0
+	)
 end
 
 local function requireRunning(kind: string)
@@ -50,25 +138,38 @@ local function keyCode(name: any): Enum.KeyCode
 	return code
 end
 
--- VirtualInputManager calls can be refused (security level, missing viewport);
--- that must surface as "unsupported", never as an ack for input that went nowhere.
-local function send(vim: any, method: string, ...: any)
+-- Virtual input throws when it is refused (capability, input that would hit
+-- interactive CoreGui); that must surface as "unsupported", never as an ack for
+-- input that went nowhere.
+local function send(input: Backend, method: string, ...: any)
+	local fn = (input :: any)[method]
+	if fn == nil then
+		error(string.format("input unsupported: %s has no %s", input.name, method), 0)
+	end
 	local args = table.pack(...)
 	local ok, err = pcall(function()
-		vim[method](vim, table.unpack(args, 1, args.n))
+		fn(table.unpack(args, 1, args.n))
 	end)
 	if not ok then
-		error(string.format("input unsupported: VirtualInputManager:%s was refused (%s)", method, tostring(err)), 0)
+		error(string.format("input unsupported: %s %s was refused (%s)", input.name, method, tostring(err)), 0)
 	end
 end
 
-local function sendKey(vim: any, action: any)
+local function sendKey(input: Backend, action: any)
 	requireRunning("key")
 	local code = keyCode(action.code)
 	local hold = math.max(tonumber(action.hold_ms) or HOLD_MS_DEFAULT, 0)
-	send(vim, "SendKeyEvent", true, code, false, game)
+	send(input, "key", true, code)
 	task.wait(hold / 1000)
-	send(vim, "SendKeyEvent", false, code, false, game)
+	send(input, "key", false, code)
+end
+
+local function sendText(input: Backend, action: any)
+	requireRunning("text")
+	if type(action.text) ~= "string" then
+		error("text action needs a text string")
+	end
+	send(input, "text", action.text)
 end
 
 local function guiInset(): Vector2
@@ -160,7 +261,7 @@ local function hitAt(x: number, y: number): (Instance?, string?)
 	return nil, nil
 end
 
-local function sendClick(vim: any, action: any): any
+local function sendClick(input: Backend, action: any): any
 	requireRunning("click")
 	local x: number?, y: number?, target: Instance? = nil, nil, nil
 	if type(action.path) == "string" then
@@ -186,12 +287,16 @@ local function sendClick(vim: any, action: any): any
 	local BUTTONS = { left = 0, right = 1, middle = 2 }
 	local button = BUTTONS[tostring(action.button)] or tonumber(action.button) or 0
 	-- Hover first: buttons that react to MouseEnter never see a teleporting cursor.
-	send(vim, "SendMouseMoveEvent", x, y, game)
+	-- A touch-emulated client has no cursor: the move is skipped, the press
+	-- still arrives (as a touch).
+	if UserInputService.MouseEnabled then
+		send(input, "move", x, y)
+	end
 	-- Hit-test what the press lands on, before the click can hide or move it.
 	local hit, layer = hitAt(x, y)
-	send(vim, "SendMouseButtonEvent", x, y, button, true, game, 0)
-	task.wait(0.03)
-	send(vim, "SendMouseButtonEvent", x, y, button, false, game, 0)
+	send(input, "button", x, y, button, true)
+	task.wait(0.05)
+	send(input, "button", x, y, button, false)
 	lastMouseX, lastMouseY = x, y
 	if connection ~= nil then
 		task.wait(0.1)
@@ -208,18 +313,21 @@ local function sendClick(vim: any, action: any): any
 	return ack
 end
 
-local function sendMove(vim: any, action: any)
+local function sendMove(input: Backend, action: any)
 	local x = tonumber(action.x)
 	local y = tonumber(action.y)
 	if not x or not y then
 		error("move action needs x and y")
+	end
+	if RunService:IsRunning() and not UserInputService.MouseEnabled then
+		error("move unsupported: this client has no mouse (touch device emulation is on), so cursor moves never reach the game", 0)
 	end
 	local duration = math.max(tonumber(action.duration_ms) or 0, 0)
 	local steps = math.max(math.floor(duration / MOVE_STEP_MS), 1)
 	local fromX, fromY = lastMouseX, lastMouseY
 	for step = 1, steps do
 		local alpha = step / steps
-		send(vim, "SendMouseMoveEvent", fromX + (x - fromX) * alpha, fromY + (y - fromY) * alpha, game)
+		send(input, "move", fromX + (x - fromX) * alpha, fromY + (y - fromY) * alpha)
 		if steps > 1 then
 			task.wait(MOVE_STEP_MS / 1000)
 		end
@@ -227,15 +335,14 @@ local function sendMove(vim: any, action: any)
 	lastMouseX, lastMouseY = x, y
 end
 
-local function sendScroll(vim: any, action: any)
+local function sendScroll(input: Backend, action: any)
 	local x = tonumber(action.x) or lastMouseX
 	local y = tonumber(action.y) or lastMouseY
 	local delta = tonumber(action.delta) or tonumber(action.amount) or 1
-	local forward = delta > 0
-	for _ = 1, math.min(math.abs(math.floor(delta)), 32) do
-		send(vim, "SendMouseWheelEvent", x, y, forward, game)
-		task.wait(0.01)
+	if delta == 0 then
+		error("scroll needs a non-zero delta")
 	end
+	send(input, "wheel", x, y, delta)
 end
 
 local function targetPosition(to: any): Vector3
@@ -335,6 +442,9 @@ return function(register: Register)
 				if kind == "key" then
 					sendKey(virtualInput(), action)
 					return { code = action.code }
+				elseif kind == "text" then
+					sendText(virtualInput(), action)
+					return { chars = utf8.len(action.text) }
 				elseif kind == "click" then
 					return sendClick(virtualInput(), action)
 				elseif kind == "move" then
@@ -350,7 +460,7 @@ return function(register: Register)
 				elseif kind == "network" then
 					error("network throttling requires Studio UI — unsupported from a plugin")
 				end
-				error("unknown action type '" .. tostring(kind) .. "' (key|click|move|scroll|nav|device|network)")
+				error("unknown action type '" .. tostring(kind) .. "' (key|text|click|move|scroll|nav|device|network)")
 			end)
 			local entry: any = { type = kind, ok = ok }
 			if ok then

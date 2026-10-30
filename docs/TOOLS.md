@@ -4,8 +4,10 @@ Conventions used by every tool:
 
 - **path** — dot-path from `game` (`game.ServerScriptService.Main`). Bracket
   form for odd names: `game.Workspace["My.Part"]`. Pseudo-paths: `@selection`
-  (Studio selection), `@game` (DataModel root). Where a param is `paths`, an
-  array is accepted and results are grouped per path.
+  (Studio selection), `@game` (DataModel root). In a client context
+  `game.Players.LocalPlayer…` names the local player without knowing its name
+  (elsewhere it fails with a hint that LocalPlayer is client-only). Where a
+  param is `paths`, an array is accepted and results are grouped per path.
 - **Output** — plain text, compact. Trees are 2-space indented. Tabular data is
   one line per row: `path<TAB>field=value ...`. Truncated responses end with
   `…more: pass cursor=N`. Errors: `ERR <code>: <message>` (codes: NOPATH,
@@ -235,9 +237,14 @@ Long-poll until a condition holds, instead of retrying a tool. `for`:
 - `attribute` — `path`, `name`, `value?` (omitted: until the attribute exists).
 - `instance` — `path` (until it exists).
 `timeoutMs` (default 30000, max 300000). Log and playtest waits read daemon
-state; attribute/instance re-check through the plugin via the fair queue,
-starting at 500 ms and backing off ×1.5 to every 4 s (Studio's HttpService
-budget). Returns `wait ok: …`, or `ERR TIMEOUT: …` naming the last state seen.
+state; attribute/instance re-check through the plugin, starting at 500 ms and
+backing off ×1.5 to every 4 s (Studio's HttpService budget). Those probes run
+in `context` (`edit` default, `server`, or `client` with `player?`), skip the
+place queue (the awaited change is often made by the op holding it), and a
+client probe gets at least 5 s so the play server's relay can answer. A probe
+that times out counts as not-yet; only the wait's own deadline ends it.
+Returns `wait ok: …`, or `ERR TIMEOUT: …` naming the last state seen
+(`last check timed out` when the final probe never answered).
 
 ## screenshot
 Always the viewport (the shared `target` arg picks the place, as for every
@@ -259,6 +266,13 @@ opaque GuiObject covering the 3D view (only checked when `hide_ui` is off),
 them), and pre-flight warnings. A capture that does not arrive in time fails
 with the reason (viewport not painting) instead of hanging.
 
+Play captures take two steps: the play DataModel captures (CaptureService) and
+returns only the temporary content id, because a running game may not turn a
+temporary texture into an EditableImage; the edit DataModel, which may, reads
+the pixels (`shot.read`). A fully black result adds
+`warn: capture is a fully black frame` (CaptureService misses the renderer on
+some Studio builds during playtests).
+
 ## profile
 `kind`: `script` (`duration_s`, max 15), `memory`. Returns top-N
 hotspots/allocations as `name  ms|MB  %` lines, not raw dumps. `top` (default 25).
@@ -268,8 +282,9 @@ MicroProfiler capture has no plugin API and is not exposed.
 `context` (`client` default — input goes to the play client, relayed by the
 play server; `edit`/`server` also accepted), `player?`, `restore?` (see visual
 pre-flight).
-`actions`: array of `{type: key|click|move|scroll|device|network|nav, ...}` —
-`key {code, hold_ms?}`, `click {path | x,y, button?}`, `move {x,y,duration_ms?}`,
+`actions`: array of `{type: key|text|click|move|scroll|device|network|nav, ...}` —
+`key {code, hold_ms?}`, `text {text}` (typed into the focused TextBox),
+`click {path | x,y, button?}`, `move {x,y,duration_ms?}`, `scroll {delta, x?, y?}`,
 `device {name|reset}` (device emulation), `network {profile}` (throttle),
 `nav {to: path|[x,y,z], timeout_ms?}` (walk character via Humanoid/PathfindingService,
 covers built-in MCP character_navigation). Requires active playtest for
@@ -286,7 +301,16 @@ part under the cursor — and for path clicks `reached=true|false`, plus
 is an `ERR … unsupported: <reason>` ack, never a silent ok: a ClickDetector
 target (synthetic clicks do not fire `MouseClick`/`MouseHoverEnter`), a hidden
 or disabled GUI, a SurfaceGui/BillboardGui button, a point outside the
-viewport, or a `VirtualInputManager` call Studio refused.
+viewport, a cursor move on a touch-emulated client (it has no mouse), or a
+virtual-input call Studio refused (it refuses input that would hit
+interactive CoreGui).
+
+Input goes through `UserInputService:CreateVirtualInput()`, which plugins may
+call in play DataModels and which feeds the real input pipeline (UIS events,
+control modules, GUI activation). `VirtualInputManager`'s `Send*Event` methods
+need RobloxScript capability that no plugin has, so they are only a fallback
+for a Studio without `CreateVirtualInput`. `nav` does not use simulated input:
+it drives the local character's Humanoid along a PathfindingService path.
 
 ## asset
 `op`: `search {query, category?, limit}`, `details {ids}`, `thumbnail {id}`,
