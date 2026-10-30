@@ -95,6 +95,7 @@ export const OP_NAMES = [
   "hist.op",
   "sel.get",
   "sync.apply", "sync.snapshot", "sync.hash", "sync.conflicts",
+  "run.job", "script.stage", "inst.transform",
 ] as const;
 export type OpName = (typeof OP_NAMES)[number];
 

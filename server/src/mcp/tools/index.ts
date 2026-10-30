@@ -10,6 +10,7 @@ import { tool as get } from "./get.ts";
 import { tool as grep } from "./grep.ts";
 import { tool as history } from "./history.ts";
 import { tool as input } from "./input.ts";
+import { tool as job } from "./job.ts";
 import { tool as logs } from "./logs.ts";
 import { tool as playtest } from "./playtest.ts";
 import { tool as profile } from "./profile.ts";
@@ -43,4 +44,5 @@ export const TOOLS: readonly ToolModule[] = [
   docs,
   history,
   sync,
+  job,
 ];
