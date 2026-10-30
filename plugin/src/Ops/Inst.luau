@@ -1,13 +1,16 @@
 --!strict
 -- inst.* ops: inspection (get/find/tree) and mutation (set/create/delete/duplicate); tree keys are 1-char (n,c,k,ln,ch) — the daemon renders them.
 
-local ChangeHistoryService = game:GetService("ChangeHistoryService")
 local CollectionService = game:GetService("CollectionService")
+local RunService = game:GetService("RunService")
 
 local Src = script.Parent.Parent :: any
 local Path = require(Src.Util.Path)
 local Serde = require(Src.Util.Serde)
 local Output = require(Src.Util.Output)
+local Recording = require(Src.Util.Recording)
+local Source = require(Src.Util.Source)
+local Transform = require(Src.Util.Transform)
 
 type Register = (string, (any) -> any) -> ()
 
@@ -44,8 +47,24 @@ local TEXT_PROPS = {
 	"TextXAlignment",
 	"TextYAlignment",
 	"RichText",
+	"FontFace",
+	"LineHeight",
+	"TextStrokeColor3",
+	"TextStrokeTransparency",
+	"TextTruncate",
 }
-local IMAGE_PROPS = { "Image", "ImageColor3", "ImageRectOffset", "ImageRectSize", "ImageTransparency", "ScaleType" }
+local IMAGE_PROPS = {
+	"Image",
+	"ImageColor3",
+	"ImageRectOffset",
+	"ImageRectSize",
+	"ImageTransparency",
+	"ResampleMode",
+	"ScaleType",
+	"SliceCenter",
+	"SliceScale",
+	"TileSize",
+}
 local LIGHT_PROPS = { "Brightness", "Color", "Enabled", "Shadows", "Range" }
 local SURFACE_MAP_PROPS = { "ColorMap", "MetalnessMap", "NormalMap", "RoughnessMap" }
 
@@ -110,17 +129,23 @@ local PROP_SETS: { { class: string, props: { string } } } = {
 	{ class = "BaseScript", props = { "Enabled" } },
 	{ class = "Script", props = { "RunContext" } },
 	{ class = "Tool", props = { "CanBeDropped", "Enabled", "Grip", "RequiresHandle", "TextureId", "ToolTip" } },
+	{ class = "GuiBase2d", props = { "AbsolutePosition", "AbsoluteSize", "AbsoluteRotation" } },
 	{
 		class = "GuiObject",
 		props = {
 			"AnchorPoint",
+			"AutomaticSize",
 			"BackgroundColor3",
 			"BackgroundTransparency",
+			"BorderColor3",
 			"BorderSizePixel",
 			"ClipsDescendants",
+			"Interactable",
+			"LayoutOrder",
 			"Position",
 			"Rotation",
 			"Size",
+			"SizeConstraint",
 			"Visible",
 			"ZIndex",
 		},
@@ -130,15 +155,48 @@ local PROP_SETS: { { class: string, props: { string } } } = {
 	{ class = "TextBox", props = TEXT_PROPS },
 	{ class = "ImageLabel", props = IMAGE_PROPS },
 	{ class = "ImageButton", props = IMAGE_PROPS },
-	{ class = "ScrollingFrame", props = { "CanvasSize", "ScrollBarThickness", "ScrollingDirection" } },
-	{ class = "SurfaceGui", props = { "Adornee", "AlwaysOnTop", "CanvasSize", "Face", "LightInfluence" } },
-	{ class = "BillboardGui", props = { "Adornee", "AlwaysOnTop", "MaxDistance", "Size", "StudsOffset" } },
-	{ class = "ScreenGui", props = { "Enabled", "IgnoreGuiInset", "ResetOnSpawn", "ZIndexBehavior" } },
 	{
-		class = "UIListLayout",
-		props = { "FillDirection", "HorizontalAlignment", "Padding", "SortOrder", "VerticalAlignment" },
+		class = "ScrollingFrame",
+		props = {
+			"AutomaticCanvasSize",
+			"CanvasPosition",
+			"CanvasSize",
+			"ElasticBehavior",
+			"ScrollBarThickness",
+			"ScrollingDirection",
+			"VerticalScrollBarInset",
+		},
+	},
+	{ class = "LayerCollector", props = { "Enabled", "ResetOnSpawn", "ZIndexBehavior" } },
+	{ class = "SurfaceGui", props = { "Adornee", "AlwaysOnTop", "CanvasSize", "Face", "LightInfluence", "PixelsPerStud" } },
+	{
+		class = "BillboardGui",
+		props = { "Adornee", "AlwaysOnTop", "ExtentsOffset", "LightInfluence", "MaxDistance", "Size", "SizeOffset", "StudsOffset" },
+	},
+	{
+		class = "ScreenGui",
+		props = { "ClipToDeviceSafeArea", "DisplayOrder", "IgnoreGuiInset", "SafeAreaCompatibility", "ScreenInsets" },
+	},
+	{
+		class = "UIGridStyleLayout",
+		props = { "FillDirection", "HorizontalAlignment", "SortOrder", "VerticalAlignment" },
+	},
+	{ class = "UIListLayout", props = { "HorizontalFlex", "ItemLineAlignment", "Padding", "VerticalFlex", "Wraps" } },
+	{ class = "UIGridLayout", props = { "CellPadding", "CellSize", "FillDirectionMaxCells", "StartCorner" } },
+	{ class = "UITableLayout", props = { "FillEmptySpaceColumns", "FillEmptySpaceRows", "MajorAxis", "Padding" } },
+	{
+		class = "UIPageLayout",
+		props = { "Animated", "Circular", "EasingDirection", "EasingStyle", "Padding", "TweenTime" },
 	},
 	{ class = "UIPadding", props = { "PaddingBottom", "PaddingLeft", "PaddingRight", "PaddingTop" } },
+	{ class = "UIAspectRatioConstraint", props = { "AspectRatio", "AspectType", "DominantAxis" } },
+	{ class = "UISizeConstraint", props = { "MaxSize", "MinSize" } },
+	{ class = "UITextSizeConstraint", props = { "MaxTextSize", "MinTextSize" } },
+	{ class = "UICorner", props = { "CornerRadius" } },
+	{ class = "UIStroke", props = { "ApplyStrokeMode", "Color", "Enabled", "LineJoinMode", "Thickness", "Transparency" } },
+	{ class = "UIGradient", props = { "Color", "Enabled", "Offset", "Rotation", "Transparency" } },
+	{ class = "UIScale", props = { "Scale" } },
+	{ class = "UIFlexItem", props = { "FlexMode", "GrowRatio", "ItemLineAlignment", "ShrinkRatio" } },
 	{ class = "Terrain", props = { "Decoration", "WaterColor", "WaterTransparency", "WaterWaveSize" } },
 	{ class = "Workspace", props = { "Gravity", "StreamingEnabled" } },
 	{
@@ -363,12 +421,6 @@ local function resolveEach(paths: any, errors: { any }): { Instance }
 		end
 	end
 	return out
-end
-
-local function waypoint(name: string)
-	pcall(function()
-		ChangeHistoryService:SetWaypoint(name)
-	end)
 end
 
 local function decodeOffset(value: any): any
@@ -632,6 +684,18 @@ local function makeFilter(filter: any): ((Instance) -> boolean)?
 end
 
 return function(register: Register)
+	-- One call = one undo step; a dry run writes nothing, so it records nothing.
+	local function registerWrite(name: string, label: string, handler: (any) -> any)
+		register(name, function(args: any): any
+			if type(args) == "table" and args.dryRun == true then
+				return handler(args)
+			end
+			return Recording.run(label, function()
+				return handler(args)
+			end)
+		end)
+	end
+
 	register("inst.get", function(args: any): any
 		local errors = {}
 		local targets = resolveEach(args.paths or args.path or "@selection", errors)
@@ -668,7 +732,7 @@ return function(register: Register)
 		return { instances = list, truncated = truncated, total = total, errors = errors }
 	end)
 
-	register("inst.set", function(args: any): any
+	registerWrite("inst.set", "OGSync set", function(args: any): any
 		local targets = args.targets
 		if type(targets) ~= "table" then
 			error("set requires a targets array")
@@ -676,14 +740,35 @@ return function(register: Register)
 		local errors = {}
 		local instanceCount = 0
 		local propCount = 0
+		local hashes = {}
 		for _, target in targets do
 			if type(target) ~= "table" then
 				table.insert(errors, { err = "each target must be an object" })
 				continue
 			end
+			-- Source travels beside props (binary-safe, maybe staged) and is
+			-- written through the editor-aware verified path, never as a raw prop.
+			local takeOk, sourceText, sourceHash = pcall(Source.take, target, "source")
+			if not takeOk then
+				table.insert(errors, { path = tostring(target.path or "?"), err = tostring(sourceText) })
+				continue
+			end
 			local resolved = resolveEach(target.paths or target.path, errors)
 			for _, inst in resolved do
 				instanceCount += 1
+				if sourceText ~= nil then
+					if not inst:IsA("LuaSourceContainer") then
+						table.insert(errors, { path = Path.of(inst), err = "Source: " .. inst.ClassName .. " is not a script" })
+					else
+						local writeOk, written = pcall(Source.write, inst, sourceText, sourceHash)
+						if writeOk then
+							propCount += 1
+							table.insert(hashes, { path = Path.of(inst), hash = written.hash, editor = written.editor })
+						else
+							table.insert(errors, { path = Path.of(inst), err = "Source: " .. tostring(written) })
+						end
+					end
+				end
 				propCount += applyProps(inst, target.props, errors)
 				applyAttrs(inst, target.attrs, target.attrs_remove, errors)
 				applyTags(inst, target.tags_add, target.tags_remove, errors)
@@ -710,20 +795,21 @@ return function(register: Register)
 				end
 			end
 		end
-		waypoint("OGSync set")
-		return { instances = instanceCount, properties = propCount, errors = errors }
+		return { instances = instanceCount, properties = propCount, errors = errors, sources = hashes }
 	end)
 
-	register("inst.create", function(args: any): any
+	registerWrite("inst.create", "OGSync create", function(args: any): any
 		local created: { string } = {}
 		local errors = {}
 		createItems(args.items, nil, created, errors)
-		waypoint("OGSync create")
 		local list, truncated, total = Output.capList(created)
 		return { created = list, truncated = truncated, total = total, errors = errors }
 	end)
 
-	register("inst.delete", function(args: any): any
+	registerWrite("inst.delete", "OGSync delete", function(args: any): any
+		-- Destroy() locks Parent, so Undo could never bring the instance back;
+		-- in edit mode a detach inside the recording is what Studio's own Delete does.
+		local undoable = not RunService:IsRunning()
 		local errors = {}
 		local targets = resolveEach(args.paths or args.path, errors)
 		local deleted = 0
@@ -738,7 +824,11 @@ return function(register: Register)
 			end
 			local path = Path.of(inst)
 			local ok, err = pcall(function()
-				inst:Destroy()
+				if undoable then
+					inst.Parent = nil
+				else
+					inst:Destroy()
+				end
 			end)
 			if ok then
 				deleted += 1
@@ -746,11 +836,10 @@ return function(register: Register)
 				table.insert(errors, { path = path, err = tostring(err) })
 			end
 		end
-		waypoint("OGSync delete")
 		return { deleted = deleted, errors = errors }
 	end)
 
-	register("inst.duplicate", function(args: any): any
+	registerWrite("inst.duplicate", "OGSync duplicate", function(args: any): any
 		local source, resolveErr = Path.resolve(args.path)
 		if not source then
 			error(resolveErr or "path not found")
@@ -789,9 +878,74 @@ return function(register: Register)
 			end
 			table.insert(created, Path.of(clone))
 		end
-		waypoint("OGSync duplicate")
 		local list, truncated, total = Output.capList(created)
 		return { created = list, truncated = truncated, total = total, errors = errors }
+	end)
+
+	registerWrite("inst.transform", "OGSync transform", function(args: any): any
+		local targets = args.targets
+		if type(targets) ~= "table" then
+			error("transform requires a targets array")
+		end
+		local errors = {}
+		local groups = {}
+		for _, target in targets do
+			if type(target) ~= "table" then
+				table.insert(errors, { err = "each target must be an object" })
+				continue
+			end
+			local specOk, spec = pcall(Transform.decodeSpec, target)
+			if not specOk then
+				table.insert(errors, { path = tostring(target.path or "?"), err = tostring(spec) })
+				continue
+			end
+			local members = {}
+			for _, inst in resolveEach(target.paths or target.path, errors) do
+				if inst:IsA("PVInstance") then
+					table.insert(members, { inst = inst, from = (inst :: PVInstance):GetPivot() })
+				else
+					table.insert(errors, { path = Path.of(inst), err = inst.ClassName .. " has no pivot (Model or BasePart only)" })
+				end
+			end
+			table.insert(groups, { spec = spec, members = members })
+		end
+
+		local steps, skipped = Transform.plan(groups)
+		local planned = {}
+		for _, step in steps do
+			local from = Transform.describe(step.from)
+			local to = Transform.describe(step.to)
+			table.insert(planned, { path = Path.of(step.inst), from = from[1], to = to[1], rotFrom = from[2], rotTo = to[2] })
+		end
+		local skips = {}
+		for _, skip in skipped do
+			table.insert(skips, { path = Path.of(skip.inst), ancestor = Path.of(skip.ancestor) })
+		end
+		local list, truncated, total = Output.capList(planned)
+		if args.dryRun == true then
+			return { dryRun = true, planned = list, truncated = truncated, total = total, skipped = skips, errors = errors }
+		end
+
+		local moved = 0
+		for _, step in steps do
+			local ok, err = pcall(function()
+				(step.inst :: PVInstance):PivotTo(step.to)
+			end)
+			if ok then
+				moved += 1
+			else
+				table.insert(errors, { path = Path.of(step.inst), err = "PivotTo: " .. tostring(err) })
+			end
+		end
+		-- Every pivot was precomputed, so a member dragged by a welded partner
+		-- after its own PivotTo shows up here as drift rather than silently.
+		for _, step in steps do
+			local drift = ((step.inst :: PVInstance):GetPivot().Position - step.to.Position).Magnitude
+			if drift > 1e-3 then
+				table.insert(errors, { path = Path.of(step.inst), err = string.format("ended %.3f studs off target (welded to a moved part?)", drift) })
+			end
+		end
+		return { moved = moved, planned = list, truncated = truncated, total = total, skipped = skips, errors = errors }
 	end)
 
 	register("inst.find", function(args: any): any

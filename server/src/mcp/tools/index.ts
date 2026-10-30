@@ -20,6 +20,7 @@ import { tool as run } from "./run.ts";
 import { tool as screenshot } from "./screenshot.ts";
 import { tool as set } from "./set.ts";
 import { tool as sync } from "./sync.ts";
+import { tool as transform } from "./transform.ts";
 import { tool as tree } from "./tree.ts";
 
 export const TOOLS: readonly ToolModule[] = [
@@ -45,4 +46,5 @@ export const TOOLS: readonly ToolModule[] = [
   history,
   sync,
   job,
+  transform,
 ];
