@@ -21,6 +21,9 @@ local ANCESTRY: { [string]: { string } } = {
 	LocalScript = { "LocalScript", "BaseScript", "LuaSourceContainer", "Instance" },
 	ModuleScript = { "ModuleScript", "LuaSourceContainer", "Instance" },
 	Part = { "Part", "BasePart", "Instance" },
+	Model = { "Model", "PVInstance", "Instance" },
+	Players = { "Players", "Instance" },
+	Player = { "Player", "Instance" },
 }
 
 local SERVICE_CLASS: { [string]: string } = {
@@ -32,6 +35,8 @@ local SERVICE_CLASS: { [string]: string } = {
 	ServerStorage = "Folder",
 	StarterPlayer = "Folder",
 	Workspace = "Folder",
+	ChangeHistoryService = "Instance",
+	Players = "Players",
 }
 
 local function findSourceDir(): string
@@ -279,10 +284,18 @@ function Harness.new()
 				return 0
 			end,
 			spawn = function(fn, ...)
-				fn(...)
+				if type(fn) == "thread" then
+					coroutine.resume(fn, ...)
+				else
+					fn(...)
+				end
 			end,
 			defer = function(fn, ...)
-				fn(...)
+				if type(fn) == "thread" then
+					coroutine.resume(fn, ...)
+				else
+					fn(...)
+				end
 			end,
 			delay = function(_seconds, fn)
 				return fn
@@ -297,6 +310,9 @@ function Harness.new()
 			return env.load(path)
 		end,
 	}
+
+	-- Tests add engine datatypes (CFrame, Vector3, ...) here before loading.
+	env.globals = globals
 
 	env.load = function(path: string)
 		local cached = env._modules[path]

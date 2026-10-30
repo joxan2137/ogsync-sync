@@ -1,0 +1,8 @@
+{
+  "name": "ogsync",
+  "version": "0.1.0",
+  "description": "Roblox Studio for Claude Code: the OGSync MCP server, a playtest edit guard, and notices when Studio overwrites an agent's edit",
+  "author": {
+    "name": "joxan"
+  }
+}

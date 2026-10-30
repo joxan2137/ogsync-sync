@@ -19,9 +19,10 @@ interface TomlTable {
   [key: string]: TomlValue | undefined;
 }
 
-/** `~/.ogsync`, created on demand (token, update state). */
+/** `~/.ogsync` (or OGSYNC_HOME), created on demand: token, update state, daemon lock. */
 export function ogsyncHome(): string {
-  const dir = join(homedir(), ".ogsync");
+  const override = process.env["OGSYNC_HOME"];
+  const dir = override !== undefined && override.trim() !== "" ? override : join(homedir(), ".ogsync");
   mkdirSync(dir, { recursive: true });
   return dir;
 }
@@ -32,6 +33,8 @@ export function loadConfig(dir: string): OgsyncConfig {
   const project = section(root, "project");
   const daemon = section(root, "daemon");
   const bind = section(root, "bind");
+  const aliases = section(root, "aliases");
+  const playtest = section(root, "playtest");
   const sync = section(root, "sync");
   const update = section(root, "update");
   const defaults = CONFIG_DEFAULTS;
@@ -46,6 +49,12 @@ export function loadConfig(dir: string): OgsyncConfig {
     },
     bind: {
       target_place: targetPlace(bind["target_place"]),
+    },
+    aliases: aliasTable(aliases),
+    playtest: {
+      max_clients: num(playtest["max_clients"], defaults.playtest.max_clients),
+      auto_end_s: num(playtest["auto_end_s"], defaults.playtest.auto_end_s),
+      plugin_grace_s: num(playtest["plugin_grace_s"], defaults.playtest.plugin_grace_s),
     },
     sync: {
       enabled: bool(sync["enabled"], defaults.sync.enabled),
@@ -71,9 +80,18 @@ file = "${d.project.file}"
 port = ${d.daemon.port}
 
 [bind]
-# placeName or placeId this daemon binds ops and sync to.
-# Omit to bind the first Studio session that connects.
+# Default target for tools and sync: an alias, placeName or placeId.
+# Omit it and tools target the only connected place; with several open they
+# ask for an explicit target instead of guessing.
 # target_place = "${projectName}"
+
+[aliases]
+# Stable names for places, usable anywhere a target is: main = 1234567890
+
+[playtest]
+max_clients = ${d.playtest.max_clients}
+auto_end_s = ${d.playtest.auto_end_s}
+plugin_grace_s = ${d.playtest.plugin_grace_s}
 
 [sync]
 enabled = ${d.sync.enabled}
@@ -200,6 +218,15 @@ function targetPlace(value: unknown): string | number | null {
   if (typeof value === "number" && Number.isFinite(value)) return value;
   if (typeof value === "string" && value.trim() !== "") return value.trim();
   return CONFIG_DEFAULTS.bind.target_place;
+}
+
+function aliasTable(table: TomlTable): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const [name, value] of Object.entries(table)) {
+    if (typeof value === "string" && value.trim() !== "") out[name] = value.trim();
+    else if (typeof value === "number" && Number.isFinite(value)) out[name] = String(value);
+  }
+  return out;
 }
 
 function envPort(): number | null {

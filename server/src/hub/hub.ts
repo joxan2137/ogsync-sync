@@ -1,11 +1,12 @@
-// Daemon side of docs/PROTOCOL.md: loopback-only Bun.serve with per-session job
-// queues, 25 s long-poll delivery, cursor acks with redelivery of unacked jobs,
-// and the Bridge implementation that MCP tools and the sync engine call.
+// Daemon side of docs/PROTOCOL.md: loopback-only Bun.serve serving every Studio
+// place on the machine at once. Peers (one plugin session per DataModel) are
+// grouped by place key and role; ops reach a place through a fair per-place
+// scheduler, survive a plugin reconnect inside a grace window, and playtest
+// start/stop go through the place's lease-holding PlaytestTracker.
 //
 // POST /rpc accepts two body shapes, both bearer-guarded:
-//   {tool, args}          → the registered MCP tool handler (CLI, docs/PROTOCOL.md)
-//   {op, args, timeoutMs} → a raw bridge op, for proxy instances whose own MCP
-//                           layer formats output locally (see hub/proxy.ts)
+//   {tool, args, caller}  → the registered tool executor (session proxies, CLI)
+//   {op, args, timeoutMs} → a raw bridge op against the hub's default target
 // Both answer `{ok: true, result}` or `{ok: false, error, code}`.
 
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
@@ -14,6 +15,7 @@ import {
   BridgeError,
   LONG_POLL_MS,
   OP_NAMES,
+  PLUGIN_INSTALL_COMMAND,
   PROTO_VERSION,
   RESULT_CAP_BYTES,
   type Bridge,
@@ -26,32 +28,73 @@ import {
   type JobResult,
   type OgsyncConfig,
   type OpName,
+  type PlaceState,
   type PullResponse,
   type PushRequest,
   type Role,
   type SessionInfo,
+  type StateResponse,
   type SyncControl,
   type SyncStatus,
 } from "../proto/types.ts";
 import { ogsyncHome } from "../config.ts";
 import { log } from "../log.ts";
+import { DAEMON_CALLER, currentCaller, runAs } from "./caller.ts";
+import { PlaytestTracker, compareHashes, type TrackerOptions } from "./playtest.ts";
+import { FairScheduler } from "./scheduler.ts";
+import {
+  basePlaceKey,
+  parseTarget,
+  resolvePlace,
+  type PlaceIdentity,
+  type TargetRole,
+  type TargetSpec,
+} from "./targets.ts";
 
 const SWEEP_MS = 5_000;
 const DEFAULT_CALL_TIMEOUT_MS = 15_000;
 const MIN_CALL_TIMEOUT_MS = 1_000;
 const MAX_CALL_TIMEOUT_MS = 600_000;
+const HASHES_TIMEOUT_MS = 60_000;
+/** Let a fresh play server settle (and the agent's first op go) before hashing every script. */
+const STALE_CHECK_DELAY_MS = 2_000;
+/** A dropped peer's in-flight calls wait this long for the same place and role to re-attach. */
+const REATTACH_GRACE_MS = 30_000;
+/** An unclean disappearance keeps the place listed (playtest "unknown") so hooks fail closed. */
+const PLACE_LINGER_MS = 120_000;
+const PLACE_CONCURRENCY = 1;
+/** How often an op waiting for a play session to attach looks again. */
+const PLAY_PEER_POLL_MS = 100;
 const MAX_BODY_BYTES = RESULT_CAP_BYTES * 2;
+const MAX_TARGET_BRIDGES = 64;
 const BEARER = "Bearer ";
 /** Studio sends this; a browser cannot without a preflight the hub never answers. */
 const PLUGIN_HEADER = "x-ogsync-plugin";
+/** Per-registration secret from the handshake; pull and push without it are unknown sessions. */
+const TOKEN_HEADER = "x-ogsync-token";
 const PLUGIN_ROUTES: ReadonlySet<string> = new Set([
   "POST /handshake",
   "GET /pull",
   "POST /push",
 ]);
+/** Read-only and secret-free: diagnostics, plugin port scans and Claude Code hooks. */
+const OPEN_ROUTES: ReadonlySet<string> = new Set(["GET /health", "GET /id", "GET /state"]);
 
 /** Ops whose args select a play-mode context; those go to the play-server session. */
-const RUNTIME_CONTEXT_OPS: ReadonlySet<OpName> = new Set<OpName>(["run.exec", "log.tail"]);
+const RUNTIME_CONTEXT_OPS: ReadonlySet<OpName> = new Set<OpName>([
+  "run.exec", "log.tail",
+  "run.job", "input.batch", "shot.capture", "wait.check",
+]);
+/**
+ * Never wait behind the place queue: stopping must work while Studio is busy
+ * with something else, and run.job collect is a wait (up to wait_ms) on an
+ * eval that already runs, which would otherwise hold the queue the whole time.
+ * wait.check is a read-only probe whose condition is often produced by the very
+ * op holding the queue (a running eval creating the awaited instance).
+ */
+const PRIORITY_OPS: ReadonlySet<OpName> = new Set<OpName>([
+  "play.stop", "play.stopSignal", "play.status", "run.job", "wait.check",
+]);
 
 const PLUGIN_ERROR_CODES = ["NOPLUGIN", "TIMEOUT", "NOPATH", "BADARG", "STUDIO"] as const satisfies readonly BridgeErrorCode[];
 
@@ -60,30 +103,55 @@ export interface HubOptions {
   version: string;
   /** Defaults to config.daemon.port; 0 picks a free port. */
   port?: number;
+  /** Tried in order until one binds; overrides `port`. */
+  ports?: readonly number[];
   hostname?: string;
   longPollMs?: number;
+  graceMs?: number;
+  /** Tests shorten these; production derives the TTL from the long-poll window. */
+  sessionTtlMs?: number;
+  sweepMs?: number;
+  tracker?: TrackerOptions;
 }
 
-export type RpcHandler = (tool: string, args: unknown) => Promise<unknown>;
+export interface RpcCaller {
+  id: string;
+  /** Working directory of the client; selects ogsync.toml (default target, aliases, sync). */
+  cwd?: string;
+  label?: string;
+}
 
+export type RpcHandler = (tool: string, args: unknown, caller: RpcCaller) => Promise<unknown>;
+export type AttachHandler = (body: { client?: unknown; cwd?: unknown }) => unknown;
+
+/** Session ids are bearer-like (pull/push key on them) and never leave the daemon. */
 export interface HealthSession {
-  session: string;
   role: Role;
   placeName: string;
   placeId: number;
+  placeKey: string;
   pluginVersion: string;
   /** Seconds since the last pull/push from this session. */
   age: number;
 }
 
-/** GET /health envelope; also how a second instance identifies a live daemon. */
+/** GET /health envelope. */
 export interface HealthResponse {
   service: "ogsync";
   version: string;
   proto: number;
   sessions: HealthSession[];
+  /** Place key the hub's own default target resolves to, if exactly one. */
   bound: string | null;
   sync: { enabled: boolean; pending: number; conflicts: number };
+}
+
+/** GET /id: the cheap identity probe the plugin and clients scan ports with. */
+export interface IdResponse {
+  service: "ogsync";
+  version: string;
+  proto: number;
+  pid: number;
 }
 
 export type RpcResponse =
@@ -93,6 +161,7 @@ export type RpcResponse =
 interface QueuedJob {
   seq: number;
   job: Job;
+  delivered: boolean;
 }
 
 interface PollWaiter {
@@ -100,22 +169,57 @@ interface PollWaiter {
   timer: ReturnType<typeof setTimeout>;
 }
 
-interface SessionEntry {
-  info: SessionInfo;
+interface Peer {
+  info: SessionInfo & { placeKey: string };
+  /** Handshake-issued secret every pull and push must present. */
+  token: string;
+  /** Set while a push is being handled: jobs it unblocks ride back on its response. */
+  pushing: boolean;
+  slot: string;
   /** Jobs delivered-but-unacked and not-yet-delivered, in seq order. */
   queue: QueuedJob[];
+  /** Acked by cursor, result not back yet: redelivered if this session re-handshakes. */
+  inflight: Map<string, Job>;
   seq: number;
   waiter: PollWaiter | null;
 }
 
-interface PendingCall {
+interface Orphaned {
   session: string;
+  jobs: QueuedJob[];
+  timer: ReturnType<typeof setTimeout>;
+}
+
+interface PlaceRecord {
+  key: string;
+  name: string;
+  placeId: number;
+  tracker: PlaytestTracker;
+  scheduler: FairScheduler<PendingCall>;
+  /** Set when the last peer left; the record lingers so its state reads "unknown". */
+  emptySince: number | null;
+  /** Token of the play test this place's edit plugin last launched; its play peers present it. */
+  launch: string | null;
+}
+
+interface PendingCall {
+  id: string;
+  job: Job;
+  place: string;
+  slot: string;
+  client: string;
+  /** Session the job was handed to; null while it waits for admission or a re-attach. */
+  session: string | null;
+  scheduled: boolean;
+  /** Handed to the plugin (pull or push response); before that a stop may cancel it. */
+  delivered: boolean;
+  onDeliver?: () => void;
   resolve: (data: unknown) => void;
   reject: (err: unknown) => void;
   onPartial?: (data: unknown) => void;
   timer: ReturnType<typeof setTimeout>;
   /** Restarts the timeout so a streaming op is not killed mid-stream. */
-  rearm?: () => void;
+  rearm: () => void;
 }
 
 class HttpError extends Error {
@@ -129,7 +233,7 @@ class HttpError extends Error {
   }
 }
 
-/** `~/.ogsync/token`, generated 0600 on first run. Guards POST /rpc only. */
+/** `~/.ogsync/token`, generated 0600 on first run. Guards POST /rpc, /attach, /shutdown. */
 export function ensureToken(): string {
   const file = join(ogsyncHome(), "token");
   if (existsSync(file)) {
@@ -148,63 +252,96 @@ export function isLoopbackHost(host: string): boolean {
   return bare === "localhost" || bare === "::1" || bare === "0:0:0:0:0:0:0:1" || bare.startsWith("127.");
 }
 
+export function versionMismatchReason(pluginProto: unknown, daemonProto = PROTO_VERSION): string {
+  return `plugin speaks proto ${String(pluginProto)}, daemon speaks proto ${daemonProto}: run \`${PLUGIN_INSTALL_COMMAND}\` (or restart \`ogsync serve\`) and reload plugins in Studio`;
+}
+
 export class Hub implements Bridge {
   readonly version: string;
   readonly token: string;
+  readonly startedAt = Date.now();
   private readonly config: OgsyncConfig;
   private readonly hostname: string;
-  private readonly requestedPort: number;
+  private readonly requestedPorts: readonly number[];
   private readonly longPollMs: number;
   private readonly sessionTtlMs: number;
-  private readonly registry = new Map<string, SessionEntry>();
+  private readonly sweepMs: number;
+  private readonly graceMs: number;
+  private readonly trackerOptions: TrackerOptions;
+  private readonly registry = new Map<string, Peer>();
+  /** slot (`placeKey/role`) → session currently holding it. */
+  private readonly slots = new Map<string, string>();
+  private readonly orphans = new Map<string, Orphaned>();
+  private readonly places = new Map<string, PlaceRecord>();
   private readonly calls = new Map<string, PendingCall>();
   private readonly listeners = new Set<(ev: BridgeEvent, from: SessionInfo) => void>();
+  private readonly targets = new Map<string, TargetBridge>();
   private server: Bun.Server<undefined> | null = null;
   private sweeper: ReturnType<typeof setInterval> | null = null;
   private rpcHandler: RpcHandler | null = null;
+  private attachHandler: AttachHandler | null = null;
+  private shutdownHandler: (() => void) | null = null;
+  private projectInfo: ((placeKey: string) => { name: string; syncEnabled: boolean } | null) | null = null;
   private syncControl: SyncControl | null = null;
-  private jobCounter = 0;
 
   constructor(opts: HubOptions) {
     this.config = opts.config;
     this.version = opts.version;
     this.hostname = opts.hostname ?? "127.0.0.1";
-    this.requestedPort = opts.port ?? opts.config.daemon.port;
+    this.requestedPorts = opts.ports ?? [opts.port ?? opts.config.daemon.port];
     this.longPollMs = opts.longPollMs ?? LONG_POLL_MS;
+    this.graceMs = opts.graceMs ?? REATTACH_GRACE_MS;
+    this.trackerOptions = opts.tracker ?? {};
     // A Studio main-thread stall must not outlive the park window plus slack,
     // or a healthy session gets swept mid-poll.
-    this.sessionTtlMs = Math.max(30_000, this.longPollMs * 2);
+    this.sessionTtlMs = opts.sessionTtlMs ?? Math.max(30_000, this.longPollMs * 2);
+    this.sweepMs = opts.sweepMs ?? SWEEP_MS;
     if (!isLoopbackHost(this.hostname)) {
       throw new Error(`refusing to bind ${this.hostname}: the hub is loopback-only and has no override`);
     }
     this.token = ensureToken();
   }
 
+  /** Binds the first free port of the requested list. */
   listen(): number {
-    this.server = Bun.serve({
-      hostname: this.hostname,
-      port: this.requestedPort,
-      // Must outlast a parked long-poll or Bun closes the socket mid-park.
-      idleTimeout: Math.min(255, Math.ceil(this.longPollMs / 1000) + 10),
-      maxRequestBodySize: MAX_BODY_BYTES,
-      fetch: (req, server) => this.handle(req, server),
-      error: (err: Error) => {
-        log.error("hub request failed:", err);
-        return this.json({ error: "internal error", code: "INTERNAL" }, 500);
-      },
-    });
-    this.sweeper = setInterval(() => this.sweep(), SWEEP_MS);
+    let lastError: unknown = null;
+    for (const port of this.requestedPorts) {
+      try {
+        this.server = Bun.serve({
+          hostname: this.hostname,
+          port,
+          // Must outlast a parked long-poll or Bun closes the socket mid-park.
+          idleTimeout: Math.min(255, Math.ceil(this.longPollMs / 1000) + 10),
+          maxRequestBodySize: MAX_BODY_BYTES,
+          fetch: (req, server) => this.handle(req, server),
+          error: (err: Error) => {
+            log.error("hub request failed:", err);
+            return this.json({ error: "internal error", code: "INTERNAL" }, 500);
+          },
+        });
+        break;
+      } catch (err) {
+        lastError = err;
+        log.debug(`port ${port} unavailable:`, err);
+      }
+    }
+    if (this.server === null) {
+      throw new Error(`no port available among ${this.requestedPorts.join(", ")}: ${errorMessage(lastError)}`);
+    }
+    this.sweeper = setInterval(() => this.sweep(), this.sweepMs);
     this.sweeper.unref?.();
     log.info(`hub listening on http://${this.hostname}:${this.port}`);
     return this.port;
   }
 
   get port(): number {
-    return this.server?.port ?? this.requestedPort;
+    return this.server?.port ?? this.requestedPorts[0] ?? 0;
   }
 
   stop(): void {
-    for (const entry of [...this.registry.values()]) this.dropSession(entry.info.session, "hub stopped");
+    for (const peer of [...this.registry.values()]) this.dropPeer(peer.info.session, "hub stopped", "fail");
+    for (const slot of [...this.orphans.keys()]) this.expireOrphans(slot, "hub stopped");
+    for (const id of [...this.calls.keys()]) this.failCall(id, new BridgeError("NOPLUGIN", "hub stopped"));
     if (this.sweeper) clearInterval(this.sweeper);
     this.sweeper = null;
     this.server?.stop(true);
@@ -215,26 +352,296 @@ export class Hub implements Bridge {
     this.rpcHandler = fn;
   }
 
+  setAttachHandler(fn: AttachHandler | null): void {
+    this.attachHandler = fn;
+  }
+
+  setShutdownHandler(fn: (() => void) | null): void {
+    this.shutdownHandler = fn;
+  }
+
+  /** Which project (if any) syncs a place; reported to the plugin panel at handshake. */
+  setProjectInfo(fn: ((placeKey: string) => { name: string; syncEnabled: boolean } | null) | null): void {
+    this.projectInfo = fn;
+  }
+
   setSyncControl(control: SyncControl | null): void {
     this.syncControl = control;
   }
 
-  // ------------------------------------------------------------- Bridge
+  // ------------------------------------------------------------- Bridge (hub's own default target)
 
   async call(op: OpName, args: unknown, opts: CallOpts = {}): Promise<unknown> {
-    const entry = this.route(op, args);
-    // Job ids must be unguessable: a result carrying a foreign id would
-    // otherwise be a way to answer another client's call.
+    return this.callTarget(this.defaultSpec(), this.config.aliases, op, args, opts);
+  }
+
+  bound(): SessionInfo | null {
+    return this.resolvedPeer(this.defaultSpec(), this.config.aliases);
+  }
+
+  sessions(): SessionInfo[] {
+    return [...this.registry.values()].map((peer) => peer.info);
+  }
+
+  onEvent(fn: (ev: BridgeEvent, from: SessionInfo) => void): () => void {
+    this.listeners.add(fn);
+    return () => this.listeners.delete(fn);
+  }
+
+  place(): PlaceState | null {
+    return this.placeState(this.defaultSpec(), this.config.aliases);
+  }
+
+  // ------------------------------------------------------------- targets
+
+  /** Bridge scoped to one target spec; cached so per-bridge state (log buffers) persists. */
+  target(spec: TargetSpec, aliases: Readonly<Record<string, string>> = {}): Bridge {
+    const key = JSON.stringify([spec.place, spec.role, aliases]);
+    const cached = this.targets.get(key);
+    if (cached) return cached;
+    const bridge = new TargetBridge(this, spec, aliases);
+    this.targets.set(key, bridge);
+    if (this.targets.size > MAX_TARGET_BRIDGES) {
+      const oldest = this.targets.keys().next().value;
+      if (oldest !== undefined) this.targets.delete(oldest);
+    }
+    return bridge;
+  }
+
+  async callTarget(
+    spec: TargetSpec,
+    aliases: Readonly<Record<string, string>>,
+    op: OpName,
+    args: unknown,
+    opts: CallOpts = {},
+  ): Promise<unknown> {
+    const place = this.resolveRecord(spec, aliases);
+    if (op === "play.start") return this.startPlaytest(place, spec.role, args, opts);
+    if (op === "play.stop") return this.stopPlaytest(place, spec.role, args, opts);
+    // A playtest that is starting or just started has no play-server peer for a
+    // second or two: wait for it instead of failing the first calls after start.
+    const waited = await this.awaitPlaySession(place, spec.role, op, args, opts.timeoutMs);
+    const timeoutMs = waited === 0 ? opts.timeoutMs : Math.max(MIN_CALL_TIMEOUT_MS, clampTimeout(opts.timeoutMs) - waited);
+    return this.callPlace(place, spec.role, op, args, { ...opts, timeoutMs });
+  }
+
+  resolvedPeer(spec: TargetSpec, aliases: Readonly<Record<string, string>>): SessionInfo | null {
+    try {
+      const place = this.resolveRecord(spec, aliases);
+      return this.peerAt(slotOf(place.key, "edit"))?.info ?? null;
+    } catch {
+      return null;
+    }
+  }
+
+  resolvedKey(spec: TargetSpec, aliases: Readonly<Record<string, string>>): string | null {
+    try {
+      return this.resolveRecord(spec, aliases).key;
+    } catch {
+      return null;
+    }
+  }
+
+  placeState(spec: TargetSpec, aliases: Readonly<Record<string, string>>): PlaceState | null {
+    try {
+      return this.describe(this.resolveRecord(spec, aliases));
+    } catch {
+      return null;
+    }
+  }
+
+  state(): StateResponse {
+    return {
+      daemon: { version: this.version, proto: PROTO_VERSION, pid: process.pid, port: this.port, startedAt: this.startedAt },
+      places: [...this.places.values()].map((place) => this.describe(place)),
+    };
+  }
+
+  private defaultSpec(): TargetSpec {
+    return parseTarget(this.config.bind.target_place);
+  }
+
+  private resolveRecord(spec: TargetSpec, aliases: Readonly<Record<string, string>>): PlaceRecord {
+    const candidates: PlaceIdentity[] = [...this.places.values()].filter((place) => this.isReachable(place));
+    const resolved = resolvePlace(spec, candidates, aliases);
+    return this.places.get(resolved.key)!;
+  }
+
+  /** Live peers, or a dropped one still inside its re-attach window. */
+  private isReachable(place: PlaceRecord): boolean {
+    if (this.peersOf(place.key).length > 0) return true;
+    for (const slot of this.orphans.keys()) if (slot.startsWith(`${place.key}/`)) return true;
+    return false;
+  }
+
+  private describe(place: PlaceRecord): PlaceState {
+    const now = Date.now();
+    return {
+      key: place.key,
+      name: place.name,
+      placeId: place.placeId,
+      peers: this.peersOf(place.key).map((peer) => ({
+        role: peer.info.role,
+        pluginVersion: peer.info.pluginVersion,
+        ageMs: now - peer.info.lastSeen,
+      })),
+      playtest: place.tracker.snapshot(),
+    };
+  }
+
+  // ------------------------------------------------------------- playtest leases
+
+  private async startPlaytest(place: PlaceRecord, role: TargetRole | null, args: unknown, opts: CallOpts): Promise<unknown> {
+    const caller = currentCaller();
+    const admission = place.tracker.admitStart(caller);
+    if (admission.kind === "refused") throw new BridgeError("LEASE", admission.reason);
+    if (admission.kind === "already") return { already: true, yours: true, ...place.tracker.snapshot() };
+    const mode = isRecord(args) && typeof args["mode"] === "string" ? args["mode"] : "solo";
+    const clients = mode === "solo" ? 1 : 0;
+    if (clients > caller.playtest.max_clients) {
+      throw new BridgeError("LEASE", `mode=${mode} spawns ${clients} client(s), over playtest.max_clients=${caller.playtest.max_clients}`);
+    }
+    place.tracker.beginStart(caller, mode, {
+      maxClients: caller.playtest.max_clients,
+      autoEndMs: caller.playtest.auto_end_s * 1000,
+      pluginGraceMs: caller.playtest.plugin_grace_s * 1000,
+    });
+    try {
+      const data = await this.callPlace(place, role, "play.start", args, opts, () => place.tracker.startDelivered());
+      // Studio was already running a test this call did not start: no credit, no lease.
+      if (isRecord(data) && data["already"] === true) {
+        place.tracker.startFailed();
+        return { ...data, yours: false };
+      }
+      if (isRecord(data) && typeof data["launch"] === "string") place.launch = data["launch"];
+      place.tracker.startSucceeded();
+      return data;
+    } catch (err) {
+      place.tracker.startFailed();
+      throw err;
+    }
+  }
+
+  private async stopPlaytest(place: PlaceRecord, role: TargetRole | null, args: unknown, opts: CallOpts): Promise<unknown> {
+    const force = isRecord(args) && args["force"] === true;
+    const admission = place.tracker.admitStop(currentCaller(), force);
+    if (admission.kind === "refused") throw new BridgeError("LEASE", admission.reason);
+    if (admission.kind === "idle") return { stopped: false, state: "idle" };
+    const queuedStart = [...this.calls.values()].find(
+      (call) => call.place === place.key && call.job.op === "play.start" && !call.delivered,
+    );
+    if (queuedStart) {
+      this.failCall(queuedStart.id, new BridgeError("LEASE", "play.start was cancelled by play.stop before it reached Studio"));
+      place.tracker.startFailed();
+      if (place.tracker.snapshot().state === "idle") return { stopped: false, state: "idle", cancelledStart: true };
+    }
+    place.tracker.beginStop();
+    try {
+      return await this.callPlace(place, role, "play.stop", args, opts);
+    } catch (err) {
+      // The play session tearing down under the call is the success signal.
+      const code = err instanceof BridgeError ? err.code : "STUDIO";
+      if (code !== "NOPLUGIN" && code !== "TIMEOUT") place.tracker.stopFailed();
+      throw err;
+    }
+  }
+
+  private endPlaytest(place: PlaceRecord, reason: string): void {
+    log.warn(`playtest on ${place.key} ${reason}`);
+    place.tracker.beginStop();
+    place.tracker.warn(reason);
+    void runAs(DAEMON_CALLER, async () => {
+      try {
+        await this.callPlace(place, null, "play.stop", { force: true }, { timeoutMs: 10_000 });
+      } catch {
+        await this.callPlace(place, "edit", "play.stopSignal", {}, { timeoutMs: 10_000 }).catch(() => {});
+      }
+    });
+  }
+
+  /** Edit vs play-server script hashes, taken as the play server comes up. */
+  private checkStaleCode(place: PlaceRecord): void {
+    const timer = setTimeout(() => void this.compareScripts(place), STALE_CHECK_DELAY_MS);
+    timer.unref?.();
+  }
+
+  private compareScripts(place: PlaceRecord): Promise<void> {
+    return runAs(DAEMON_CALLER, async () => {
+      if (this.server === null || this.peerAt(slotOf(place.key, "edit")) === null) return;
+      try {
+        const opts = { timeoutMs: HASHES_TIMEOUT_MS };
+        const server = await this.callPlace(place, "server", "play.hashes", {}, opts);
+        const edit = await this.callPlace(place, "edit", "play.hashes", {}, opts);
+        place.tracker.setStale(compareHashes(hashesOf(edit), hashesOf(server)));
+      } catch (err) {
+        log.debug(`script hash comparison for ${place.key} failed:`, err);
+      }
+    });
+  }
+
+  // ------------------------------------------------------------- routing and admission
+
+  /** ms spent waiting (bounded by the op timeout and playtest.plugin_grace_s); 0 when nothing to wait for. */
+  private async awaitPlaySession(
+    place: PlaceRecord,
+    role: TargetRole | null,
+    op: OpName,
+    args: unknown,
+    timeoutMs: number | undefined,
+  ): Promise<number> {
+    if (!needsPlaySession(op, args, role) || this.hasPlaySession(place)) return 0;
+    const started = Date.now();
+    const deadline = started + Math.min(clampTimeout(timeoutMs), currentCaller().playtest.plugin_grace_s * 1000);
+    while (!this.hasPlaySession(place) && isPlaytestActive(place) && Date.now() < deadline) {
+      await Bun.sleep(PLAY_PEER_POLL_MS);
+    }
+    return Date.now() - started;
+  }
+
+  /** A play-server peer (or one re-attaching), or run mode, where the edit peer is the server. */
+  private hasPlaySession(place: PlaceRecord): boolean {
+    const server = slotOf(place.key, "server");
+    return this.peerAt(server) !== null || this.orphans.has(server) || place.tracker.runMode();
+  }
+
+  private noPlaySession(place: PlaceRecord, why: string): BridgeError {
+    const playtest = place.tracker.snapshot();
+    if (playtest.state !== "starting" && playtest.state !== "running") {
+      return new BridgeError("NOPLUGIN", `${why} needs a play-server session on ${place.key}; start a playtest first`);
+    }
+    const forS = Math.round((Date.now() - playtest.since) / 1000);
+    return new BridgeError(
+      "NOPLUGIN",
+      `${why}: the playtest on ${place.key} has been ${playtest.state} for ${forS}s but its play session never connected; "Load User Plugins in Test Mode" is probably off`,
+    );
+  }
+
+  private callPlace(
+    place: PlaceRecord,
+    role: TargetRole | null,
+    op: OpName,
+    args: unknown,
+    opts: CallOpts,
+    onDeliver?: () => void,
+  ): Promise<unknown> {
+    const routed = this.route(place, op, args, role);
     const id = crypto.randomUUID();
     const timeoutMs = clampTimeout(opts.timeoutMs);
-    const job: Job = { id, op, args: withPlayer(args, opts.player) };
+    // Job ids must be unguessable: a result carrying a foreign id would
+    // otherwise be a way to answer another client's call.
+    const job: Job = { id, op, args: withPlayer(routed.args, routed.player ?? opts.player), timeoutMs };
     return new Promise<unknown>((resolve, reject) => {
-      const expire = () => {
-        this.dropQueuedJob(entry, id);
-        this.failCall(id, new BridgeError("TIMEOUT", `${op} not answered in ${timeoutMs}ms`));
-      };
+      const expire = () => this.failCall(id, new BridgeError("TIMEOUT", `${op} not answered in ${timeoutMs}ms`));
       const call: PendingCall = {
-        session: entry.info.session,
+        id,
+        job,
+        place: place.key,
+        slot: routed.slot,
+        client: currentCaller().id,
+        session: null,
+        scheduled: !PRIORITY_OPS.has(op),
+        delivered: false,
+        onDeliver,
         resolve,
         reject,
         onPartial: opts.onPartial,
@@ -245,66 +652,73 @@ export class Hub implements Bridge {
         },
       };
       this.calls.set(id, call);
-      this.enqueue(entry, job);
+      if (call.scheduled) place.scheduler.submit(call.client, call, (admitted) => this.deliver(admitted));
+      else this.deliver(call);
     });
   }
 
-  bound(): SessionInfo | null {
-    return this.boundEntry()?.info ?? null;
-  }
-
-  sessions(): SessionInfo[] {
-    return [...this.registry.values()].map((entry) => entry.info);
-  }
-
-  onEvent(fn: (ev: BridgeEvent, from: SessionInfo) => void): () => void {
-    this.listeners.add(fn);
-    return () => this.listeners.delete(fn);
-  }
-
-  // ------------------------------------------------------------- routing
-
-  private route(op: OpName, args: unknown): SessionEntry {
-    const edit = this.boundEntry();
-    if (op === "play.stopSignal") return this.requireBound(edit, op);
-
-    const playServer = this.playServerEntry(edit?.info ?? null);
-    if (op === "play.stop") return playServer ?? this.requireBound(edit, op);
-
+  private route(
+    place: PlaceRecord,
+    op: OpName,
+    args: unknown,
+    role: TargetRole | null,
+  ): { slot: string; args: unknown; player?: string | number } {
+    const edit = slotOf(place.key, "edit");
+    const server = slotOf(place.key, "server");
+    const requireServer = (why: string): string => {
+      if (this.peerAt(server) || this.orphans.has(server)) return server;
+      if (place.tracker.runMode()) return edit;
+      throw this.noPlaySession(place, why);
+    };
+    const requireClients = (why: string): string => {
+      if (this.peerAt(server) || this.orphans.has(server)) return server;
+      if (place.tracker.runMode()) {
+        throw new BridgeError(
+          "NOPLUGIN",
+          `${why}: ${place.key} is in run mode (playtest mode=server), which has no clients; start mode=solo for a client`,
+        );
+      }
+      return requireServer(why);
+    };
+    if (role !== null && role.startsWith("client")) {
+      const player = role === "client" ? undefined : Number(role.slice("client-".length));
+      return { slot: requireClients(`target ${role}`), args: asClientContext(args), player };
+    }
+    if (role === "server") return { slot: requireServer("target server"), args };
+    if (role === "edit" || op === "play.stopSignal") return { slot: edit, args };
+    if (op === "play.stop") return { slot: this.peerAt(server) ? server : edit, args };
     const ctx = runtimeContext(op, args);
-    if (ctx !== null) {
-      if (!playServer) throw new BridgeError("NOPLUGIN", `${op} ctx=${ctx} needs a play-mode session; start a playtest first`);
-      return playServer;
+    if (ctx === "client") return { slot: requireClients(`${op} ctx=client`), args };
+    if (ctx === "server") return { slot: requireServer(`${op} ctx=server`), args };
+    return { slot: edit, args };
+  }
+
+  private deliver(call: PendingCall): void {
+    if (!this.calls.has(call.id)) return;
+    const peer = this.peerAt(call.slot);
+    if (peer) {
+      call.session = peer.info.session;
+      this.enqueue(peer, call.job);
+      return;
     }
-    return this.requireBound(edit, op);
-  }
-
-  private requireBound(entry: SessionEntry | null, op: OpName): SessionEntry {
-    if (!entry) {
-      throw new BridgeError("NOPLUGIN", `no Studio session bound for ${op}; open the place with the OGSync plugin enabled`);
+    const orphaned = this.orphans.get(call.slot);
+    if (orphaned) {
+      orphaned.jobs.push({ seq: 0, job: call.job, delivered: false });
+      return;
     }
-    return entry;
+    this.failCall(
+      call.id,
+      new BridgeError("NOPLUGIN", `no Studio session for ${call.slot}; open the place with the OGSync plugin enabled`),
+    );
   }
 
-  private boundEntry(): SessionEntry | null {
-    const matching = [...this.registry.values()].filter((entry) => this.matchesTarget(entry.info));
-    return matching.find((entry) => entry.info.role === "edit") ?? matching[0] ?? null;
+  private peerAt(slot: string): Peer | null {
+    const session = this.slots.get(slot);
+    return session === undefined ? null : (this.registry.get(session) ?? null);
   }
 
-  private playServerEntry(place: SessionInfo | null): SessionEntry | null {
-    for (const entry of this.registry.values()) {
-      if (entry.info.role !== "server") continue;
-      const sameTarget = place ? placeKey(entry.info) === placeKey(place) : this.matchesTarget(entry.info);
-      if (sameTarget) return entry;
-    }
-    return null;
-  }
-
-  private matchesTarget(place: { placeId: number; placeName: string }): boolean {
-    const target = this.config.bind.target_place;
-    if (target === null) return true;
-    const wanted = String(target).trim().toLowerCase();
-    return wanted === place.placeName.trim().toLowerCase() || wanted === String(place.placeId);
+  private peersOf(placeKey: string): Peer[] {
+    return [...this.registry.values()].filter((peer) => peer.info.placeKey === placeKey);
   }
 
   // ------------------------------------------------------------- http
@@ -326,11 +740,11 @@ export class Hub implements Bridge {
       req.headers.get("origin") !== null ||
       req.headers.get("sec-fetch-site") !== null ||
       req.headers.get("sec-fetch-mode") !== null;
-    if (browserish && route !== "GET /health") {
+    if (browserish && !OPEN_ROUTES.has(route)) {
       log.warn(`refused browser-originated ${route} (origin ${req.headers.get("origin") ?? "-"})`);
       return this.json({ error: "browser requests are not accepted", code: "FORBIDDEN" }, 403);
     }
-    if (PLUGIN_ROUTES.has(route) && req.headers.get(PLUGIN_HEADER) !== PROTO_VERSION.toString()) {
+    if (PLUGIN_ROUTES.has(route) && !this.pluginHeaderOk(route, req.headers.get(PLUGIN_HEADER))) {
       return this.json(
         { error: `plugin endpoints require ${PLUGIN_HEADER}: ${PROTO_VERSION}`, code: "FORBIDDEN" },
         403,
@@ -343,11 +757,23 @@ export class Hub implements Bridge {
         case "GET /pull":
           return await this.pull(req, url);
         case "POST /push":
-          return this.push(await this.body<PushRequest>(req));
+          return this.push(await this.body<PushRequest>(req), req.headers.get(TOKEN_HEADER));
         case "GET /health":
           return this.json(this.health());
+        case "GET /id":
+          return this.json({ service: "ogsync", version: this.version, proto: PROTO_VERSION, pid: process.pid } satisfies IdResponse);
+        case "GET /state":
+          return this.json(this.state());
         case "POST /rpc":
           return await this.rpc(req);
+        case "POST /attach":
+          this.authorize(req);
+          return this.json({ ok: true, result: this.attachHandler?.(await this.body(req)) ?? null });
+        case "POST /shutdown":
+          this.authorize(req);
+          if (!this.shutdownHandler) throw new HttpError(503, "NOSHUTDOWN", "this hub has no shutdown handler");
+          setTimeout(this.shutdownHandler, 50);
+          return this.json({ ok: true });
         default:
           return this.json({ error: `no route for ${route}`, code: "NOROUTE" }, 404);
       }
@@ -355,6 +781,15 @@ export class Hub implements Bridge {
       if (err instanceof HttpError) return this.json({ error: err.message, code: err.code }, err.status);
       throw err;
     }
+  }
+
+  /**
+   * A handshake from another protocol version must still reach handshake()
+   * so the plugin gets a mismatch reason instead of a bare 403.
+   */
+  private pluginHeaderOk(route: string, header: string | null): boolean {
+    if (header === null) return false;
+    return route === "POST /handshake" ? /^\d+$/.test(header) : header === PROTO_VERSION.toString();
   }
 
   private async body<T>(req: Request): Promise<T> {
@@ -373,16 +808,26 @@ export class Hub implements Bridge {
     }
   }
 
+  private authorize(req: Request): void {
+    const auth = req.headers.get("authorization") ?? "";
+    const provided = auth.startsWith(BEARER) ? auth.slice(BEARER.length).trim() : "";
+    if (provided === "" || provided !== this.token) {
+      throw new HttpError(401, "AUTH", `bearer token required (${join(ogsyncHome(), "token")})`);
+    }
+  }
+
   private handshake(req: HandshakeRequest): HandshakeResponse {
     const base = { proto: PROTO_VERSION, serverVersion: this.version };
     const updatePlugin = req.pluginVersion !== this.version;
     const reject = (reason: string): HandshakeResponse => {
-      log.warn(`handshake refused for ${short(req.session)}: ${reason}`);
+      log.warn(`handshake refused for ${short(String(req.session))}: ${reason}`);
       return { ...base, accepted: false, reason, updatePlugin, syncEnabled: false };
     };
 
     if (req.proto !== PROTO_VERSION) {
-      return { ...base, accepted: false, reason: `proto ${req.proto} unsupported, daemon speaks ${PROTO_VERSION}`, updatePlugin: true, syncEnabled: false };
+      const reason = versionMismatchReason(req.proto);
+      log.warn(`handshake refused for ${short(String(req.session))}: ${reason}`);
+      return { ...base, accepted: false, reason, updatePlugin: true, syncEnabled: false };
     }
     if (typeof req.session !== "string" || req.session === "") return reject("missing session id");
     if (req.role !== "edit" && req.role !== "server" && req.role !== "client") {
@@ -391,99 +836,221 @@ export class Hub implements Bridge {
     if (typeof req.placeName !== "string" || typeof req.placeId !== "number") {
       return reject("handshake needs placeName (string) and placeId (number)");
     }
-    if (!this.matchesTarget(req)) {
-      return reject(`place ${describePlace(req)} does not match target_place ${String(this.config.bind.target_place)}`);
-    }
-    const taken = [...this.registry.values()].find(
-      (entry) =>
-        entry.info.session !== req.session && entry.info.role === req.role && placeKey(entry.info) === placeKey(req),
-    );
-    if (taken) return reject(`another ${req.role} session is already bound to ${describePlace(req)}`);
-    // With no target_place configured, first edit session wins outright —
-    // otherwise sync would silently pick whichever place handshook first.
-    if (this.config.bind.target_place === null && req.role === "edit") {
-      const otherEdit = [...this.registry.values()].find(
-        (entry) => entry.info.role === "edit" && entry.info.session !== req.session,
-      );
-      if (otherEdit) {
-        return reject(
-          `daemon is bound to ${describePlace(otherEdit.info)}; set bind.target_place in ogsync.toml to choose a place`,
-        );
-      }
-    }
 
-    const existing = this.registry.get(req.session);
     const now = Date.now();
-    const info: SessionInfo = {
+    const existing = this.registry.get(req.session);
+    // The secret proves the same plugin load, and one load never changes place.
+    const readopted =
+      existing !== undefined &&
+      typeof req.token === "string" &&
+      req.token === existing.token &&
+      existing.info.role === req.role &&
+      existing.info.placeId === req.placeId;
+    if (existing && !readopted) {
+      // A fresh registration under a known id (plugin restarted its loop without
+      // the old secret): park the old one's calls for the new one to adopt.
+      const samePlace = existing.info.role === req.role && existing.info.placeId === req.placeId;
+      this.dropPeer(req.session, "re-registered", samePlace ? "orphan" : "fail");
+    }
+    const pairing = readopted ? null : this.pairPlayPeer(req);
+    const placeKey = readopted
+      ? existing.info.placeKey
+      : this.assignKey(pairing?.key ?? basePlaceKey(req), req.role, req.session);
+    const info: Peer["info"] = {
       session: req.session,
       role: req.role,
       pluginVersion: req.pluginVersion,
       placeId: req.placeId,
       placeName: req.placeName,
-      connectedAt: existing?.info.connectedAt ?? now,
+      placeKey,
+      connectedAt: readopted ? existing.info.connectedAt : now,
       lastSeen: now,
     };
-    if (existing) {
-      // A re-handshake means the plugin restarted its loop at cursor 0; keeping
-      // the old queue would redeliver jobs it already ran.
+    const place = this.ensurePlace(placeKey, req);
+    if (pairing?.warning) place.tracker.warn(pairing.warning);
+
+    if (readopted) {
+      // Same plugin load reconnecting: everything it was given and has not
+      // answered goes out again. Its job log answers duplicates from cache,
+      // so an op it already ran is never run twice.
       this.releaseWaiter(existing);
-      for (const queued of existing.queue) {
-        this.failCall(queued.job.id, new BridgeError("NOPLUGIN", "session re-handshook before the job ran"));
-      }
+      const pending = [...existing.inflight.values(), ...existing.queue.map((queued) => queued.job)];
+      existing.inflight.clear();
       existing.queue = [];
       existing.seq = 0;
       existing.info = info;
+      for (const job of pending) if (this.calls.has(job.id)) this.enqueue(existing, job);
     } else {
-      this.registry.set(req.session, { info, queue: [], seq: 0, waiter: null });
+      const peer: Peer = {
+        info,
+        token: crypto.randomUUID(),
+        pushing: false,
+        slot: slotOf(placeKey, req.role),
+        queue: [],
+        inflight: new Map(),
+        seq: 0,
+        waiter: null,
+      };
+      this.registry.set(req.session, peer);
+      this.slots.set(peer.slot, req.session);
+      this.adoptOrphans(peer);
+      if (req.role === "server") {
+        place.tracker.serverPeer(true);
+        this.checkStaleCode(place);
+      }
     }
 
-    log.info(`session ${short(req.session)} ${req.role} ${describePlace(req)} plugin ${req.pluginVersion}`);
+    log.info(`session ${short(req.session)} ${req.role} ${placeKey} (${req.placeName}) plugin ${req.pluginVersion}${readopted ? " re-adopted" : ""}`);
     if (updatePlugin) {
-      log.warn(`plugin ${req.pluginVersion} != daemon ${this.version} — reload plugins in Studio to pick up the new OGSync.rbxm`);
+      log.warn(`plugin ${req.pluginVersion} != daemon ${this.version}; run \`${PLUGIN_INSTALL_COMMAND}\` and reload plugins in Studio`);
     }
+    const project = this.projectInfo?.(placeKey) ?? { name: this.config.project.name, syncEnabled: this.config.sync.enabled };
     return {
       ...base,
       accepted: true,
       updatePlugin,
-      syncEnabled: this.config.sync.enabled,
-      projectName: this.config.project.name,
+      syncEnabled: project.syncEnabled,
+      projectName: project.name,
+      placeKey,
+      token: this.registry.get(req.session)!.token,
     };
   }
 
+  /**
+   * Which place a play-mode peer belongs to. Published places pair by placeId.
+   * An unsaved or local-file place (placeId 0) gives its play DataModels a
+   * generic name ("Game"), so they pair by the launch token the edit plugin
+   * passed in the test args, else by being the only placeId-0 edit place
+   * without a play server (preferring one that is starting or running).
+   * Never a place with another placeId; with several candidates, none.
+   */
+  private pairPlayPeer(req: HandshakeRequest): { key: string | null; warning?: string } | null {
+    if (req.role === "edit") return null;
+    const editPlaces = [...this.places.values()].filter(
+      (place) => place.placeId === req.placeId && this.peerAt(slotOf(place.key, "edit")) !== null,
+    );
+    if (typeof req.launch === "string" && req.launch !== "") {
+      const launched = editPlaces.find((place) => place.launch === req.launch);
+      if (launched) return { key: launched.key };
+    }
+    if (req.placeId > 0) return null;
+    if (editPlaces.some((place) => place.key === basePlaceKey(req))) return null;
+    const free = editPlaces.filter((place) => this.peerAt(slotOf(place.key, "server")) === null);
+    const active = free.filter((place) => ["starting", "running", "stopping"].includes(place.tracker.snapshot().state));
+    const chosen = active.length === 1 ? active[0] : active.length === 0 && free.length === 1 ? free[0] : undefined;
+    if (chosen) return { key: chosen.key };
+    if (free.length === 0) return null;
+    return {
+      key: null,
+      warning: `play server "${req.placeName}" (placeId 0) could belong to ${free.map((place) => place.key).join(" or ")}; kept separate. Save or publish the place, or start the playtest through OGSync, to pair it`,
+    };
+  }
+
+  /** Several Studios with one placeId each get their own key: `<id>`, `<id>~2`, … */
+  private assignKey(base: string, role: Role, session: string): string {
+    for (let n = 1; ; n += 1) {
+      const key = n === 1 ? base : `${base}~${n}`;
+      const holder = this.slots.get(slotOf(key, role));
+      if (holder === undefined || holder === session) return key;
+    }
+  }
+
+  private ensurePlace(key: string, req: HandshakeRequest): PlaceRecord {
+    const name = req.placeName.replace(/ @ .*$/, "").trim();
+    let place = this.places.get(key);
+    if (!place) {
+      place = {
+        key,
+        name,
+        placeId: req.placeId,
+        tracker: new PlaytestTracker(this.trackerOptions),
+        scheduler: new FairScheduler<PendingCall>(PLACE_CONCURRENCY),
+        emptySince: null,
+        launch: null,
+      };
+      this.places.set(key, place);
+    }
+    // Play DataModels carry a dated or generic name; the edit peer's is the one to show.
+    if (req.role === "edit") place.name = name;
+    place.emptySince = null;
+    return place;
+  }
+
+  private adoptOrphans(peer: Peer): void {
+    const orphaned = this.orphans.get(peer.slot);
+    if (!orphaned) return;
+    clearTimeout(orphaned.timer);
+    this.orphans.delete(peer.slot);
+    for (const queued of orphaned.jobs) {
+      const call = this.calls.get(queued.job.id);
+      if (!call) continue;
+      if (queued.delivered && orphaned.session !== peer.info.session) {
+        this.failCall(
+          queued.job.id,
+          new BridgeError("NOPLUGIN", `Studio session changed while ${queued.job.op} was in flight; it may or may not have run`),
+        );
+        continue;
+      }
+      call.session = peer.info.session;
+      this.enqueue(peer, queued.job);
+    }
+  }
+
   private pull(req: Request, url: URL): Promise<Response> | Response {
-    const entry = this.requireSession(url.searchParams.get("session"));
-    entry.info.lastSeen = Date.now();
+    const peer = this.requireSession(url.searchParams.get("session"), req.headers.get(TOKEN_HEADER));
+    peer.info.lastSeen = Date.now();
 
     // A cursor beyond our own seq means the plugin kept state across a daemon
     // restart; honoring it would filter out every job we ever enqueue.
     const cursor = Number(url.searchParams.get("cursor") ?? "0");
-    if (Number.isFinite(cursor) && cursor > 0 && cursor <= entry.seq) {
-      entry.queue = entry.queue.filter((queued) => queued.seq > cursor);
-    } else if (cursor > entry.seq) {
-      log.warn(`session ${short(entry.info.session)} sent cursor ${cursor} > seq ${entry.seq}; ignoring ack`);
+    if (Number.isFinite(cursor) && cursor > 0 && cursor <= peer.seq) {
+      for (const queued of peer.queue) {
+        if (queued.seq <= cursor && this.calls.has(queued.job.id)) peer.inflight.set(queued.job.id, queued.job);
+      }
+      peer.queue = peer.queue.filter((queued) => queued.seq > cursor);
+    } else if (cursor > peer.seq) {
+      log.warn(`session ${short(peer.info.session)} sent cursor ${cursor} > seq ${peer.seq}; ignoring ack`);
     }
-    this.releaseWaiter(entry);
-    if (entry.queue.length > 0) return this.jobsResponse(entry);
+    this.releaseWaiter(peer);
+    if (peer.queue.length > 0) return this.jobsResponse(peer);
 
     return new Promise<Response>((resolve) => {
       const timer = setTimeout(() => {
-        entry.waiter = null;
+        peer.waiter = null;
         resolve(this.noContent());
       }, this.longPollMs);
       const waiter: PollWaiter = { resolve, timer };
-      entry.waiter = waiter;
+      peer.waiter = waiter;
       req.signal.addEventListener("abort", () => {
-        if (entry.waiter === waiter) this.releaseWaiter(entry);
+        if (peer.waiter === waiter) this.releaseWaiter(peer);
       });
     });
   }
 
-  private push(body: PushRequest): Response {
-    const entry = this.requireSession(body.session);
-    entry.info.lastSeen = Date.now();
-    for (const result of body.results ?? []) this.settle(result, entry);
-    for (const ev of body.events ?? []) this.dispatch(ev, entry);
-    return this.json({ ok: true });
+  /**
+   * Settling a result usually admits the place's next call; its job rides back
+   * on this response instead of waking the parked pull, which would cost the
+   * plugin a second request per job against Studio's HttpService budget.
+   */
+  private push(body: PushRequest, token: string | null): Response {
+    const peer = this.requireSession(body.session, token);
+    peer.info.lastSeen = Date.now();
+    peer.pushing = true;
+    try {
+      for (const result of body.results ?? []) this.settle(result, peer);
+      for (const ev of body.events ?? []) this.dispatch(ev, peer);
+    } finally {
+      peer.pushing = false;
+    }
+    if (this.registry.get(peer.info.session) !== peer || peer.queue.length === 0) return this.json({ ok: true });
+    const jobs = peer.queue.map((queued) => queued.job);
+    // Delivered on this response, so acked too: the pull never resends them.
+    for (const queued of peer.queue) {
+      this.markDelivered(queued);
+      peer.inflight.set(queued.job.id, queued.job);
+    }
+    peer.queue = [];
+    return this.json({ ok: true, jobs });
   }
 
   private health(): HealthResponse {
@@ -499,14 +1066,14 @@ export class Hub implements Bridge {
       version: this.version,
       proto: PROTO_VERSION,
       sessions: this.sessions().map((info) => ({
-        session: info.session,
         role: info.role,
         placeName: info.placeName,
         placeId: info.placeId,
+        placeKey: info.placeKey ?? basePlaceKey(info),
         pluginVersion: info.pluginVersion,
         age: Math.round((now - info.lastSeen) / 1000),
       })),
-      bound: this.bound()?.session ?? null,
+      bound: this.bound()?.placeKey ?? null,
       sync: {
         enabled: status?.enabled ?? this.config.sync.enabled,
         pending: status?.pending ?? 0,
@@ -516,12 +1083,14 @@ export class Hub implements Bridge {
   }
 
   private async rpc(req: Request): Promise<Response> {
-    const auth = req.headers.get("authorization") ?? "";
-    const provided = auth.startsWith(BEARER) ? auth.slice(BEARER.length).trim() : "";
-    if (provided === "" || provided !== this.token) {
-      throw new HttpError(401, "AUTH", `bearer token required (${join(ogsyncHome(), "token")})`);
-    }
-    const body = await this.body<{ tool?: unknown; op?: unknown; args?: unknown; timeoutMs?: unknown }>(req);
+    this.authorize(req);
+    const body = await this.body<{
+      tool?: unknown;
+      op?: unknown;
+      args?: unknown;
+      timeoutMs?: unknown;
+      caller?: unknown;
+    }>(req);
     const args = body.args ?? {};
     const timeoutMs = typeof body.timeoutMs === "number" ? body.timeoutMs : undefined;
     try {
@@ -532,8 +1101,8 @@ export class Hub implements Bridge {
         return this.json({ ok: true, result: await this.call(body.op as OpName, args, { timeoutMs }) });
       }
       if (typeof body.tool === "string") {
-        if (!this.rpcHandler) throw new HttpError(503, "NORPC", "this daemon runs without the MCP layer");
-        return this.json({ ok: true, result: await this.rpcHandler(body.tool, args) });
+        if (!this.rpcHandler) throw new HttpError(503, "NORPC", "this daemon runs without the tool layer");
+        return this.json({ ok: true, result: await this.rpcHandler(body.tool, args, rpcCaller(body.caller)) });
       }
       throw new HttpError(400, "BADARG", "expected {tool, args} or {op, args}");
     } catch (err) {
@@ -544,42 +1113,48 @@ export class Hub implements Bridge {
 
   // ------------------------------------------------------------- queues
 
-  private enqueue(entry: SessionEntry, job: Job): void {
-    entry.seq += 1;
-    entry.queue.push({ seq: entry.seq, job });
-    log.debug(`job ${job.id} ${job.op} → ${short(entry.info.session)} (seq ${entry.seq})`);
-    this.flush(entry);
+  private enqueue(peer: Peer, job: Job): void {
+    peer.seq += 1;
+    peer.queue.push({ seq: peer.seq, job, delivered: false });
+    log.debug(`job ${job.id} ${job.op} → ${short(peer.info.session)} (seq ${peer.seq})`);
+    if (!peer.pushing) this.flush(peer);
   }
 
-  private flush(entry: SessionEntry): void {
-    const waiter = entry.waiter;
-    if (!waiter || entry.queue.length === 0) return;
-    entry.waiter = null;
+  private flush(peer: Peer): void {
+    const waiter = peer.waiter;
+    if (!waiter || peer.queue.length === 0) return;
+    peer.waiter = null;
     clearTimeout(waiter.timer);
-    waiter.resolve(this.jobsResponse(entry));
+    waiter.resolve(this.jobsResponse(peer));
   }
 
-  private jobsResponse(entry: SessionEntry): Response {
+  private markDelivered(queued: QueuedJob): void {
+    if (queued.delivered) return;
+    queued.delivered = true;
+    const call = this.calls.get(queued.job.id);
+    if (!call || call.delivered) return;
+    call.delivered = true;
+    call.onDeliver?.();
+  }
+
+  private jobsResponse(peer: Peer): Response {
+    for (const queued of peer.queue) this.markDelivered(queued);
     const payload: PullResponse = {
-      cursor: entry.queue.at(-1)?.seq ?? entry.seq,
-      jobs: entry.queue.map((queued) => queued.job),
+      cursor: peer.queue.at(-1)?.seq ?? peer.seq,
+      jobs: peer.queue.map((queued) => queued.job),
     };
     return this.json(payload);
   }
 
-  private releaseWaiter(entry: SessionEntry): void {
-    const waiter = entry.waiter;
+  private releaseWaiter(peer: Peer): void {
+    const waiter = peer.waiter;
     if (!waiter) return;
-    entry.waiter = null;
+    peer.waiter = null;
     clearTimeout(waiter.timer);
     waiter.resolve(this.noContent());
   }
 
-  private dropQueuedJob(entry: SessionEntry, id: string): void {
-    entry.queue = entry.queue.filter((queued) => queued.job.id !== id);
-  }
-
-  private settle(result: JobResult, from: SessionEntry): void {
+  private settle(result: JobResult, from: Peer): void {
     const call = this.calls.get(result.id);
     if (!call) {
       log.debug(`result for unknown job ${result.id}`);
@@ -597,11 +1172,10 @@ export class Hub implements Bridge {
     }
     if (result.partial === true) {
       call.onPartial?.(result.data);
-      call.rearm?.();
+      call.rearm();
       return;
     }
-    clearTimeout(call.timer);
-    this.calls.delete(result.id);
+    this.finishCall(call);
     if (result.ok) call.resolve(result.data);
     else call.reject(pluginError(result.err));
   }
@@ -609,48 +1183,131 @@ export class Hub implements Bridge {
   private failCall(id: string, err: BridgeError): void {
     const call = this.calls.get(id);
     if (!call) return;
-    clearTimeout(call.timer);
-    this.calls.delete(id);
+    this.finishCall(call);
     call.reject(err);
   }
 
-  private dispatch(ev: BridgeEvent, entry: SessionEntry): void {
+  /** Forgets a call wherever it sits: admission queue, a peer queue, an orphan list. */
+  private finishCall(call: PendingCall): void {
+    clearTimeout(call.timer);
+    this.calls.delete(call.id);
+    const peer = call.session === null ? undefined : this.registry.get(call.session);
+    if (peer) {
+      peer.queue = peer.queue.filter((queued) => queued.job.id !== call.id);
+      peer.inflight.delete(call.id);
+    }
+    const orphaned = this.orphans.get(call.slot);
+    if (orphaned) orphaned.jobs = orphaned.jobs.filter((queued) => queued.job.id !== call.id);
+    if (call.scheduled) {
+      const scheduler = this.places.get(call.place)?.scheduler;
+      if (scheduler && !scheduler.cancel(call)) scheduler.release(call);
+    }
+  }
+
+  private dispatch(ev: BridgeEvent, peer: Peer): void {
     for (const fn of this.listeners) {
       try {
-        fn(ev, entry.info);
+        fn(ev, peer.info);
       } catch (err) {
         log.warn("event listener failed:", err);
       }
     }
-    if (ev.ev === "playtestState" && ev.state === "stopped" && entry.info.role !== "edit") {
-      this.dropSession(entry.info.session, "playtest stopped");
+    if (ev.ev === "goodbye") {
+      this.dropPeer(peer.info.session, "unloaded", "fail");
+      return;
     }
+    if (ev.ev !== "playtestState") return;
+    if (ev.state === "stopped" && peer.info.role !== "edit") {
+      this.dropPeer(peer.info.session, "playtest stopped", "fail");
+      return;
+    }
+    const tracker = this.places.get(peer.info.placeKey)?.tracker;
+    tracker?.report(peer.info.role === "edit" ? "edit" : "server", ev.state, ev.mode, ev.players);
   }
 
-  private requireSession(session: string | null): SessionEntry {
-    const entry = session === null ? undefined : this.registry.get(session);
-    if (!entry) throw new HttpError(409, "NOSESSION", "unknown session, handshake first");
-    return entry;
+  private requireSession(session: string | null, token: string | null): Peer {
+    const peer = session === null ? undefined : this.registry.get(session);
+    // A wrong secret reads exactly like an unknown session: re-handshake. That
+    // also makes a goodbye from an older registration a no-op.
+    if (!peer || token === null || token !== peer.token) {
+      throw new HttpError(409, "NOSESSION", "unknown session, handshake first");
+    }
+    return peer;
   }
 
-  private dropSession(session: string, why: string): void {
-    const entry = this.registry.get(session);
-    if (!entry) return;
+  /**
+   * "orphan" parks the peer's unanswered jobs for the re-attach grace window
+   * (expiry, transport loss); "fail" answers them NOPLUGIN now (the plugin is
+   * gone on purpose: playtest over, plugin unloaded).
+   */
+  private dropPeer(session: string, why: string, mode: "orphan" | "fail"): void {
+    const peer = this.registry.get(session);
+    if (!peer) return;
     this.registry.delete(session);
-    this.releaseWaiter(entry);
-    for (const [id, call] of this.calls) {
-      if (call.session === session) this.failCall(id, new BridgeError("NOPLUGIN", `session ${short(session)} ${why}`));
+    if (this.slots.get(peer.slot) === session) this.slots.delete(peer.slot);
+    this.releaseWaiter(peer);
+    const jobs: QueuedJob[] = [
+      ...[...peer.inflight.values()].map((job) => ({ seq: 0, job, delivered: true })),
+      ...peer.queue,
+    ].filter((queued) => this.calls.has(queued.job.id));
+    for (const queued of jobs) {
+      const call = this.calls.get(queued.job.id);
+      if (call) call.session = null;
+    }
+    if (mode === "orphan" && jobs.length > 0) {
+      const existing = this.orphans.get(peer.slot);
+      if (existing) clearTimeout(existing.timer);
+      const orphaned: Orphaned = {
+        session,
+        jobs: [...(existing?.jobs ?? []), ...jobs],
+        timer: setTimeout(() => this.expireOrphans(peer.slot, `did not re-attach within ${this.graceMs / 1000}s`), this.graceMs),
+      };
+      orphaned.timer.unref?.();
+      this.orphans.set(peer.slot, orphaned);
+    } else {
+      for (const queued of jobs) {
+        this.failCall(queued.job.id, new BridgeError("NOPLUGIN", `session ${short(session)} ${why}`));
+      }
+    }
+
+    const place = this.places.get(peer.info.placeKey);
+    if (place) {
+      if (peer.info.role === "server") place.tracker.serverPeer(false);
+      if (this.peersOf(place.key).length === 0) {
+        // An unloaded edit plugin is a clean exit; anything else lingers as "unknown".
+        if (why === "unloaded" && peer.info.role === "edit" && !this.isReachable(place)) this.places.delete(place.key);
+        else place.emptySince = Date.now();
+      }
     }
     log.info(`session ${short(session)} ${why}`);
   }
 
+  private expireOrphans(slot: string, why: string): void {
+    const orphaned = this.orphans.get(slot);
+    if (!orphaned) return;
+    clearTimeout(orphaned.timer);
+    this.orphans.delete(slot);
+    for (const queued of orphaned.jobs) {
+      this.failCall(queued.job.id, new BridgeError("NOPLUGIN", `no Studio session for ${slot}: ${why}`));
+    }
+  }
+
   private sweep(): void {
-    const cutoff = Date.now() - this.sessionTtlMs;
-    for (const entry of [...this.registry.values()]) {
+    const now = Date.now();
+    const cutoff = now - this.sessionTtlMs;
+    for (const peer of [...this.registry.values()]) {
       // A parked poll is proof of life even though lastSeen is not refreshed
       // until it returns; sweeping it would drop a healthy session's queue.
-      if (entry.waiter !== null || entry.info.lastSeen >= cutoff) continue;
-      this.dropSession(entry.info.session, `expired after ${this.sessionTtlMs / 1000}s without a pull`);
+      if (peer.waiter !== null || peer.info.lastSeen >= cutoff) continue;
+      this.dropPeer(peer.info.session, `expired after ${this.sessionTtlMs / 1000}s without a pull`, "orphan");
+    }
+    for (const place of [...this.places.values()]) {
+      if (place.emptySince !== null && now - place.emptySince > PLACE_LINGER_MS && !this.isReachable(place)) {
+        this.places.delete(place.key);
+        continue;
+      }
+      const reason = place.tracker.due();
+      if (reason !== null) this.endPlaytest(place, reason);
     }
   }
 
@@ -664,6 +1321,41 @@ export class Hub implements Bridge {
   }
 }
 
+/** A Bridge whose every call resolves its target at call time, so a reconnect or a new place never strands it. */
+class TargetBridge implements Bridge {
+  constructor(
+    private readonly hub: Hub,
+    private readonly spec: TargetSpec,
+    private readonly aliases: Readonly<Record<string, string>>,
+  ) {}
+
+  call(op: OpName, args: unknown, opts?: CallOpts): Promise<unknown> {
+    return this.hub.callTarget(this.spec, this.aliases, op, args, opts);
+  }
+
+  bound(): SessionInfo | null {
+    return this.hub.resolvedPeer(this.spec, this.aliases);
+  }
+
+  sessions(): SessionInfo[] {
+    return this.hub.sessions();
+  }
+
+  onEvent(fn: (ev: BridgeEvent, from: SessionInfo) => void): () => void {
+    return this.hub.onEvent((ev, from) => {
+      if (from.placeKey === this.hub.resolvedKey(this.spec, this.aliases)) fn(ev, from);
+    });
+  }
+
+  place(): PlaceState | null {
+    return this.hub.placeState(this.spec, this.aliases);
+  }
+}
+
+function slotOf(placeKey: string, role: Role): string {
+  return `${placeKey}/${role}`;
+}
+
 /** NaN, negatives and 2^31+ all fire setTimeout immediately; clamp to a sane band. */
 function clampTimeout(requested: number | undefined): number {
   if (requested === undefined || !Number.isFinite(requested)) return DEFAULT_CALL_TIMEOUT_MS;
@@ -675,10 +1367,43 @@ function withPlayer(args: unknown, player: CallOpts["player"]): unknown {
   return { ...args, player };
 }
 
+/** The plugin dispatcher brokers a job to a client when its args say ctx=client. */
+function asClientContext(args: unknown): unknown {
+  const base = isRecord(args) ? args : {};
+  return { ...base, ctx: "client", ...(base["context"] === undefined ? {} : { context: "client" }) };
+}
+
+function needsPlaySession(op: OpName, args: unknown, role: TargetRole | null): boolean {
+  if (role === "server" || role?.startsWith("client")) return true;
+  if (role === "edit" || op === "play.stop" || op === "play.stopSignal") return false;
+  return runtimeContext(op, args) !== null;
+}
+
+function isPlaytestActive(place: PlaceRecord): boolean {
+  const state = place.tracker.snapshot().state;
+  return state === "starting" || state === "running";
+}
+
 function runtimeContext(op: OpName, args: unknown): "server" | "client" | null {
   if (!RUNTIME_CONTEXT_OPS.has(op) || !isRecord(args)) return null;
   const ctx = args["ctx"] ?? args["context"];
   return ctx === "server" || ctx === "client" ? ctx : null;
+}
+
+function hashesOf(data: unknown): Record<string, string> {
+  if (!isRecord(data) || !isRecord(data["hashes"])) return {};
+  const out: Record<string, string> = {};
+  for (const [path, hash] of Object.entries(data["hashes"])) if (typeof hash === "string") out[path] = hash;
+  return out;
+}
+
+function rpcCaller(raw: unknown): RpcCaller {
+  if (!isRecord(raw) || typeof raw["id"] !== "string" || raw["id"] === "") return { id: "rpc" };
+  return {
+    id: raw["id"],
+    cwd: typeof raw["cwd"] === "string" ? raw["cwd"] : undefined,
+    label: typeof raw["label"] === "string" ? raw["label"] : undefined,
+  };
 }
 
 function pluginError(err: string | undefined): BridgeError {
@@ -692,7 +1417,7 @@ function pluginError(err: string | undefined): BridgeError {
 
 function rpcFailure(err: unknown): RpcResponse {
   if (err instanceof BridgeError) return { ok: false, error: err.message, code: err.code };
-  return { ok: false, error: err instanceof Error ? err.message : String(err), code: "STUDIO" };
+  return { ok: false, error: errorMessage(err), code: "STUDIO" };
 }
 
 function payloadSize(data: unknown): number {
@@ -708,12 +1433,8 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function placeKey(place: { placeId: number; placeName: string }): string {
-  return `${place.placeId}:${place.placeName.toLowerCase()}`;
-}
-
-function describePlace(place: { placeId: number; placeName: string }): string {
-  return place.placeId > 0 ? `${place.placeName}#${place.placeId}` : place.placeName;
+function errorMessage(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
 }
 
 function short(session: string): string {

@@ -22,6 +22,7 @@ class FakePlugin {
   ]);
   #base: string;
   #session = "fake-session-0001";
+  #token = "";
   #stopped = false;
   #loop: Promise<void> | null = null;
 
@@ -30,7 +31,7 @@ class FakePlugin {
   }
 
   async handshake(): Promise<Response> {
-    return fetch(`${this.#base}/handshake`, {
+    const res = await fetch(`${this.#base}/handshake`, {
       method: "POST",
       headers: PLUGIN_HEADERS,
       body: JSON.stringify({
@@ -42,27 +43,40 @@ class FakePlugin {
         placeName: PLACE,
       }),
     });
+    this.#token = ((await res.clone().json()) as { token?: string }).token ?? "";
+    return res;
+  }
+
+  /** Every pull and push presents the handshake's per-session secret. */
+  #headers(): Record<string, string> {
+    return { ...PLUGIN_HEADERS, "x-ogsync-token": this.#token };
+  }
+
+  /** Results go up; any job they unblocked comes back on the same response. */
+  async #answer(jobs: Job[]): Promise<void> {
+    while (jobs.length > 0) {
+      const results = jobs.map((job) => this.#execute(job));
+      this.handled.push(...jobs);
+      const res = await fetch(`${this.#base}/push`, {
+        method: "POST",
+        headers: this.#headers(),
+        body: JSON.stringify({ session: this.#session, results }),
+      });
+      jobs = ((await res.json()) as { jobs?: Job[] }).jobs ?? [];
+    }
   }
 
   start(): void {
     this.#loop = (async () => {
       while (!this.#stopped) {
         const res = await fetch(`${this.#base}/pull?session=${this.#session}&cursor=${this.cursor}`, {
-          headers: PLUGIN_HEADERS,
+          headers: this.#headers(),
         }).catch(() => null);
         if (res === null || this.#stopped) return;
         if (res.status !== 200) continue;
         const body = (await res.json()) as { cursor: number; jobs: Job[] };
         this.cursor = body.cursor;
-        const results = body.jobs.map((job) => this.#execute(job));
-        this.handled.push(...body.jobs);
-        if (results.length > 0) {
-          await fetch(`${this.#base}/push`, {
-            method: "POST",
-            headers: PLUGIN_HEADERS,
-            body: JSON.stringify({ session: this.#session, results }),
-          });
-        }
+        await this.#answer(body.jobs);
       }
     })();
   }
@@ -75,7 +89,7 @@ class FakePlugin {
   async pushEvent(ev: Record<string, unknown>): Promise<void> {
     await fetch(`${this.#base}/push`, {
       method: "POST",
-      headers: PLUGIN_HEADERS,
+      headers: this.#headers(),
       body: JSON.stringify({ session: this.#session, events: [ev] }),
     });
   }
