@@ -1,19 +1,35 @@
 #!/usr/bin/env bun
-// ogsync CLI. Hand-rolled arg parsing (no dependencies) over five commands:
-// serve (default), init, update, plugin, status, version.
+// ogsync CLI. Hand-rolled arg parsing (no dependencies): serve (default), daemon,
+// call, status, init, update, plugin, doctor, version.
 //
-// The MCP and sync layers load lazily so a failure in either degrades the
-// daemon (warning) instead of killing startup. The specifiers stay literal:
-// `bun build --compile` only bundles modules it can see statically.
+// `serve` never owns the Studio bridge: it makes sure the one machine-wide
+// daemon is running (spawning it detached when absent) and forwards every MCP
+// tool call to it, so sessions come and go without dropping Studio.
+//
+// The MCP layer loads lazily so a failure degrades instead of killing startup.
+// The specifiers stay literal: `bun build --compile` only bundles modules it
+// can see statically.
 
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { basename, join } from "node:path";
-import type { Bridge, OgsyncConfig, SyncControl } from "./proto/types.ts";
+import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
+import { errLine, type StateResponse } from "./proto/types.ts";
 import { CONFIG_FILE, defaultConfigToml, loadConfig } from "./config.ts";
 import { formatChecks, runDoctor } from "./doctor.ts";
 import { log } from "./log.ts";
-import { Hub, ensureToken, type HealthResponse, type RpcHandler } from "./hub/hub.ts";
-import { RemoteBridge, detectExistingDaemon } from "./hub/proxy.ts";
+import { ensureToken, type RpcCaller } from "./hub/hub.ts";
+import {
+  DaemonClient,
+  applyLoopbackNoProxy,
+  ensureDaemon,
+  findDaemon,
+  launchDaemon,
+  localRequest,
+  stopDaemon,
+} from "./daemon/client.ts";
+import { ATTACH_INTERVAL_MS } from "./daemon/projects.ts";
+import { runDaemon } from "./daemon/run.ts";
+import { formatState } from "./daemon/status.ts";
 import { getPluginBytes } from "./update/plugin-blob.ts";
 import { installPlugin, uninstallPlugin } from "./update/plugin-installer.ts";
 import { checkForUpdate, removeStaleBackup, reportOutcome, scheduleAutoUpdates } from "./update/updater.ts";
@@ -21,25 +37,31 @@ import { VERSION } from "./version.ts";
 
 const PROJECT_FILE = "default.project.json";
 const SOURCE_DIRS = ["src/server", "src/client", "src/shared"];
-const VALUE_FLAGS = new Set(["port", "p"]);
+const VALUE_FLAGS = new Set(["port", "p", "as"]);
+/** Forwarded calls wait this much past the tool's own timeout: queueing plus settle time. */
+const FORWARD_SLACK_MS = 30_000;
+const DEFAULT_FORWARD_MS = 60_000;
 
 const HELP = `ogsync ${VERSION} — MCP server, live sync and Studio plugin for Roblox
 
 usage: ogsync <command> [options]
 
 commands:
-  serve                    run the daemon: MCP over stdio + Studio bridge + sync (default)
-      --no-mcp             bridge and sync only, leave stdio alone
-      --port <n>           hub port (default from ogsync.toml, OGSYNC_PORT, else 3667)
+  serve                    MCP over stdio for one session; starts the shared daemon if needed (default)
+      --no-mcp             keep this project's sync attached without MCP
+      --port <n>           preferred daemon port when one has to be started
+  daemon run|start|stop    run in the foreground / ensure one is running / stop it
+  call <tool> '<json>'     run one tool through the daemon and print the result JSON
+      --as <id>            lease identity (default cli:<dir>; also OGSYNC_CLIENT)
+  status [--json]          daemon, places, peers and playtest state
   init                     scaffold ${CONFIG_FILE}, ${PROJECT_FILE} and src/ in this directory
   update                   check GitHub Releases now and install a newer build
   plugin [install|uninstall]
                            write or remove the Studio plugin file
-  status [--port <n>]      query the local daemon's /health
   doctor [--port <n>]      diagnose the project, plugin, daemon and Studio binding
   version                  print the version
 
-env: OGSYNC_PORT, OGSYNC_LOG=debug, OGSYNC_PLUGINS_DIR, GITHUB_TOKEN`;
+env: OGSYNC_PORT, OGSYNC_HOME, OGSYNC_CLIENT, OGSYNC_LOG=debug, OGSYNC_PLUGINS_DIR, GITHUB_TOKEN`;
 
 interface Args {
   command: string;
@@ -48,6 +70,7 @@ interface Args {
 }
 
 async function main(): Promise<number> {
+  applyLoopbackNoProxy();
   const args = parseArgs(process.argv.slice(2));
   if (flag(args, "help", "h")) {
     log.info(HELP);
@@ -60,6 +83,10 @@ async function main(): Promise<number> {
   switch (args.command === "" ? "serve" : args.command) {
     case "serve":
       return serve(args);
+    case "daemon":
+      return daemon(args);
+    case "call":
+      return call(args);
     case "init":
       return init();
     case "update":
@@ -86,39 +113,110 @@ async function main(): Promise<number> {
 async function serve(args: Args): Promise<number> {
   const cwd = process.cwd();
   const config = loadConfig(cwd);
-  const port = portFlag(args) ?? config.daemon.port;
   const withMcp = !flag(args, "no-mcp");
   removeStaleBackup();
-
-  const existing = await detectExistingDaemon(port);
-  let hub: Hub | null = null;
-  let bridge: Bridge;
-  if (existing) {
-    if (!withMcp) {
-      log.error(`ogsync ${existing.version} already owns :${port}; --no-mcp leaves this instance nothing to do`);
-      return 1;
-    }
-    log.info(`ogsync ${existing.version} already serving on :${port} — forwarding ops to it over /rpc`);
-    bridge = new RemoteBridge(port, ensureToken());
-  } else {
-    hub = new Hub({ config, version: VERSION, port });
-    hub.listen();
-    bridge = hub;
-  }
-
+  // Only `serve` and `plugin install` write the plugin file; the daemon never does.
   await installStudioPlugin();
 
-  // Only the port owner runs sync; a proxy instance would duplicate every write.
-  let sync: SyncControl | null = null;
-  if (hub) {
-    sync = await startSyncEngine(bridge, config, cwd);
-    hub.setSyncControl(sync);
+  const daemon = await ensureDaemon({ port: portFlag(args) ?? config.daemon.port });
+  if (daemon.identity.version !== VERSION) {
+    log.warn(`daemon runs ${daemon.identity.version}, this session ${VERSION}; \`ogsync daemon stop\` lets the next session start the new build`);
   }
-  if (withMcp) await startMcpLayer(bridge, hub, sync);
-  if (hub) scheduleAutoUpdates(config);
-  else log.debug("proxy mode: the owning daemon handles updates");
+  const client = new DaemonClient(daemon.port, ensureToken(), clientIdentity(args, `serve-${process.pid}`));
+  keepAttached(client, cwd, !withMcp);
 
+  if (withMcp) {
+    try {
+      const { startForwardingMcp } = await import("./mcp/server.ts");
+      await startForwardingMcp(VERSION, (tool, toolArgs) => client.callTool(tool, toolArgs, forwardTimeout(toolArgs)) as Promise<CallToolResult>);
+      // The session ends when its MCP client closes stdin; the daemon stays.
+      process.stdin.on("end", () => process.exit(0));
+    } catch (err) {
+      log.warn("mcp server unavailable:", err);
+    }
+  }
+  scheduleAutoUpdates(config);
   return 0;
+}
+
+async function daemon(args: Args): Promise<number> {
+  const action = args.positionals[0] ?? "start";
+  if (action === "run") return runDaemon({ port: portFlag(args) });
+  if (action === "detach") {
+    launchDaemon(portFlag(args));
+    // Nothing may keep this hop alive: the daemon's parent must be gone.
+    process.exit(0);
+  }
+  if (action === "start") {
+    const started = await ensureDaemon({ port: portFlag(args) });
+    out(`ogsync daemon ${started.identity.version} pid ${started.identity.pid} on 127.0.0.1:${started.port}${started.spawned ? " (started)" : ""}`);
+    return 0;
+  }
+  if (action === "stop") {
+    const running = await findDaemon();
+    if (!running) {
+      out("no ogsync daemon running");
+      return 0;
+    }
+    const stopped = await stopDaemon(running.port);
+    out(stopped ? `stopped daemon pid ${running.identity.pid}` : `daemon pid ${running.identity.pid} did not stop`);
+    return stopped ? 0 : 1;
+  }
+  log.error(`unknown daemon action "${action}"; expected run, start or stop`);
+  return 1;
+}
+
+async function call(args: Args): Promise<number> {
+  const [tool, raw] = args.positionals;
+  if (tool === undefined) {
+    log.error("usage: ogsync call <tool> '<json-args>'");
+    return 1;
+  }
+  let toolArgs: unknown = {};
+  if (raw !== undefined) {
+    try {
+      toolArgs = JSON.parse(raw);
+    } catch {
+      log.error(`tool args are not valid JSON: ${raw}`);
+      return 1;
+    }
+  }
+  const cwd = process.cwd();
+  const daemon = await ensureDaemon({ port: portFlag(args) });
+  const client = new DaemonClient(daemon.port, ensureToken(), clientIdentity(args, `cli:${basename(cwd)}`));
+  let result: CallToolResult;
+  try {
+    result = (await client.callTool(tool, toolArgs, forwardTimeout(toolArgs))) as CallToolResult;
+  } catch (err) {
+    result = { content: [{ type: "text", text: errLine(err) }] };
+  }
+  out(JSON.stringify(result));
+  const failed = result.content.some((part) => part.type === "text" && part.text.startsWith("ERR "));
+  return failed ? 1 : 0;
+}
+
+/** Caller identity: leases and fair queueing key on `id`, ogsync.toml comes from `cwd`. */
+function clientIdentity(args: Args, fallback: string): RpcCaller {
+  const cwd = process.cwd();
+  const flagged = args.flags.get("as");
+  const id = typeof flagged === "string" ? flagged : (process.env["OGSYNC_CLIENT"] ?? fallback);
+  return { id, cwd, label: basename(cwd) };
+}
+
+function keepAttached(client: DaemonClient, cwd: string, holdOpen: boolean): void {
+  const attach = (): void => {
+    client.attach(cwd).catch((err: unknown) => log.debug("attach failed:", err));
+  };
+  attach();
+  const timer = setInterval(attach, ATTACH_INTERVAL_MS);
+  // Under MCP the session lives as long as stdin; --no-mcp lives for this loop.
+  if (!holdOpen) timer.unref?.();
+}
+
+function forwardTimeout(toolArgs: unknown): number {
+  const record = typeof toolArgs === "object" && toolArgs !== null ? (toolArgs as Record<string, unknown>) : {};
+  const own = [record["timeoutMs"], record["timeout_ms"]].find((value): value is number => typeof value === "number");
+  return (own ?? DEFAULT_FORWARD_MS) + FORWARD_SLACK_MS;
 }
 
 function init(): number {
@@ -167,13 +265,20 @@ async function managePlugin(args: Args): Promise<number> {
 }
 
 async function status(args: Args): Promise<number> {
-  const port = portFlag(args) ?? loadConfig(process.cwd()).daemon.port;
-  const daemon = await detectExistingDaemon(port);
-  if (!daemon) {
-    log.error(`no ogsync daemon answering on 127.0.0.1:${port} — start one with \`ogsync serve\``);
+  const json = flag(args, "json");
+  const running = await findDaemon();
+  if (!running) {
+    if (json) out(JSON.stringify({ daemon: null, places: [] }));
+    else log.error("no ogsync daemon running; `ogsync serve` or `ogsync daemon start` starts one");
     return 1;
   }
-  printHealth(daemon.health, port);
+  const res = await localRequest(running.port, "GET", "/state", { timeoutMs: 2_000 });
+  if (res.status !== 200) {
+    log.error(`daemon on :${running.port} answered /state with HTTP ${res.status}`);
+    return 1;
+  }
+  const state = res.body as StateResponse;
+  out(json ? JSON.stringify(state) : formatState(state));
   return 0;
 }
 
@@ -181,24 +286,6 @@ async function doctor(args: Args): Promise<number> {
   const checks = await runDoctor(process.cwd(), portFlag(args) ?? undefined);
   out(formatChecks(checks));
   return checks.some((c) => c.level === "fail") ? 1 : 0;
-}
-
-function printHealth(health: HealthResponse, port: number): void {
-  out(`ogsync ${health.version} on 127.0.0.1:${port} (proto ${health.proto})`);
-  out(
-    `sync: ${health.sync.enabled ? "enabled" : "disabled"} pending=${health.sync.pending} conflicts=${health.sync.conflicts}`,
-  );
-  if (health.sessions.length === 0) {
-    out("sessions: none — open the place in Studio with the OGSync plugin enabled");
-    return;
-  }
-  out("sessions: (* = bound)");
-  for (const session of health.sessions) {
-    const marker = session.session === health.bound ? "*" : " ";
-    out(
-      `  ${marker} ${session.session.slice(0, 8)} ${session.role.padEnd(6)} ${session.placeName} last seen ${session.age}s ago`,
-    );
-  }
 }
 
 /**
@@ -215,40 +302,6 @@ async function installStudioPlugin(): Promise<void> {
   } catch (err) {
     log.warn("plugin install failed:", err);
   }
-}
-
-async function startSyncEngine(bridge: Bridge, config: OgsyncConfig, cwd: string): Promise<SyncControl | null> {
-  if (!config.sync.enabled) {
-    log.info(`sync disabled in ${CONFIG_FILE}`);
-    return null;
-  }
-  try {
-    const { SyncEngine } = await import("./sync/engine.ts");
-    const engine = new SyncEngine(bridge, config, cwd);
-    await engine.start();
-    return engine;
-  } catch (err) {
-    log.warn("sync engine unavailable:", err);
-    return null;
-  }
-}
-
-async function startMcpLayer(bridge: Bridge, hub: Hub | null, sync: SyncControl | null): Promise<void> {
-  try {
-    const { startMcp } = await import("./mcp/server.ts");
-    const started: unknown = await startMcp(bridge, { sync, version: VERSION });
-    const callTool = asRpcHandler(started);
-    if (hub && callTool) hub.setRpcHandler(callTool);
-  } catch (err) {
-    log.warn("mcp server unavailable:", err);
-  }
-}
-
-/** POST /rpc {tool} only works once startMcp hands back a tool executor. */
-function asRpcHandler(started: unknown): RpcHandler | null {
-  if (typeof started !== "object" || started === null) return null;
-  const callTool = (started as { callTool?: unknown }).callTool;
-  return typeof callTool === "function" ? (callTool as RpcHandler) : null;
 }
 
 function writeIfMissing(file: string, contents: string, created: string[], kept: string[]): void {

@@ -22,12 +22,18 @@ and put it on your PATH. It updates itself from then on.
 ```sh
 cd my-roblox-project
 ogsync init      # scaffold ogsync.toml + default.project.json + src/ (skip if you already use Rojo)
-ogsync serve     # daemon: MCP over stdio + Studio bridge + two-way sync
+ogsync serve     # MCP over stdio; starts the shared daemon (bridge + sync) if needed
 ```
 
 `serve` installs the Studio plugin on first run. **Restart Studio** so it picks
 the plugin up, then open your place — the OGSync button in the Plugins tab shows
 the connection panel.
+
+`serve` is a thin per-session proxy: one daemon per machine owns the Studio
+bridge and outlives every session, so several Claude sessions (and shells)
+share the same places, queue and playtest leases. Agents without MCP use
+`ogsync call <tool> '<json-args>'`; `ogsync status` shows daemon, places,
+peers and playtest state (`--json` for hooks; same body as `GET /state`).
 
 Register it with Claude Code:
 
@@ -52,22 +58,33 @@ and sync state, and tells you the next action for anything failing.
 
 ## Choosing which Studio instance to drive
 
-With several places open, pin one in `ogsync.toml` — the daemon binds to exactly
-that session and never touches the others:
+The daemon serves every open place. Each tool takes `target`
+(`<alias|placeId|name>[:edit|server|client-N]`); the default comes from the
+`ogsync.toml` in the session's directory. With several places open and no
+target, tools answer `ERR TARGET` with the candidates instead of guessing:
 
 ```toml
 [bind]
-target_place = "MyPlace"   # place name or place id
+target_place = "main"      # alias, place name or place id
+
+[aliases]
+main = 1234567890          # stable names for places
+
+[playtest]
+max_clients = 2            # agent playtests never spawn more clients
+auto_end_s = 1800          # agent-started playtests stop after this
 ```
 
 ## Commands
 
 | | |
 |---|---|
-| `ogsync serve` | daemon: MCP + bridge + sync (`--no-mcp`, `--port N`) |
+| `ogsync serve` | MCP session proxy; ensures the daemon (`--no-mcp` keeps sync attached, `--port N`) |
+| `ogsync daemon run\|start\|stop` | foreground daemon / ensure one runs / stop it |
+| `ogsync call <tool> '<json>'` | one tool call from a shell, result JSON on stdout (`--as <id>` lease identity) |
+| `ogsync status [--json]` | daemon, places, peers, playtest state |
 | `ogsync init` | scaffold config and project files |
 | `ogsync doctor` | diagnose the setup |
-| `ogsync status` | query the running daemon |
 | `ogsync plugin install\|uninstall` | manage the Studio plugin file |
 | `ogsync update` | check GitHub Releases now |
 

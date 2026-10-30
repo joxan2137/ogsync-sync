@@ -1,8 +1,16 @@
 // Shared contract between hub, MCP tools, sync engine, and the wire protocol.
 // docs/PROTOCOL.md is the authoritative wire spec; keep in lockstep.
 
-export const PROTO_VERSION = 1;
+export const PROTO_VERSION = 2;
 export const DEFAULT_PORT = 3667;
+/**
+ * The only ports the daemon binds, in preference order; the plugin scans the
+ * same list (plugin/src/Util/Ports.luau) when its last port stops answering.
+ * All sit below the Windows dynamic range, where Hyper-V reserves blocks.
+ */
+export const CANDIDATE_PORTS: readonly number[] = [3667, 3668, 3669, 13667, 23667, 33667, 43667, 45667];
+/** Named in every version-mismatch error: the one command that writes the plugin file. */
+export const PLUGIN_INSTALL_COMMAND = "ogsync plugin install";
 export const LONG_POLL_MS = 25_000;
 export const RESULT_CAP_BYTES = 1_048_576;
 
@@ -18,6 +26,8 @@ export interface SessionInfo {
   placeName: string;
   connectedAt: number;
   lastSeen: number;
+  /** placeId, or the normalized name of an unsaved place; `~N` marks a duplicate Studio. */
+  placeKey?: string;
 }
 
 // ---------------------------------------------------------------- wire envelopes
@@ -25,6 +35,8 @@ export interface SessionInfo {
 export interface HandshakeRequest {
   proto: number;
   session: string;
+  /** Secret from this session's previous handshake; proves a reconnect, not a new plugin load. */
+  token?: string;
   role: Role;
   pluginVersion: string;
   placeId: number;
@@ -39,12 +51,17 @@ export interface HandshakeResponse {
   updatePlugin: boolean;
   syncEnabled: boolean;
   projectName?: string;
+  placeKey?: string;
+  /** Per-registration secret: send as X-OGSync-Token on every pull and push. */
+  token?: string;
 }
 
 export interface Job {
   id: string;
   op: OpName;
   args: unknown;
+  /** The daemon's deadline for this call; plugin-side waits (client broker) size themselves to it. */
+  timeoutMs?: number;
 }
 
 export interface PullResponse {
@@ -72,11 +89,16 @@ export type BridgeEvent =
   | { ev: "instRemoved"; path: string }
   | { ev: "instRenamed"; path: string; oldPath: string }
   | { ev: "log"; ctx: Role; level: "info" | "warn" | "error"; msg: string; ts: number }
-  | { ev: "playtestState"; state: "starting" | "running" | "stopped"; mode?: string }
+  // Pushed on change and every PLAYTEST_HEARTBEAT_MS; "stopped" ends a play-mode peer.
+  | { ev: "playtestState"; state: PlaytestReport; mode?: string; players?: number; hb?: boolean }
   | { ev: "selection"; paths: string[] }
   // Connection-panel UI (docs/PLUGIN_CONTRACT.md § Connection panel)
   | { ev: "syncToggle"; paused: boolean }
-  | { ev: "resolveConflict"; file: string; keep: "fs" | "studio" };
+  | { ev: "resolveConflict"; file: string; keep: "fs" | "studio" }
+  // Plugin unloading: drop the peer now instead of waiting out the session TTL.
+  | { ev: "goodbye" };
+
+export type PlaytestReport = "idle" | "starting" | "running" | "stopping" | "stopped";
 
 // ---------------------------------------------------------------- ops
 
@@ -96,6 +118,8 @@ export const OP_NAMES = [
   "sel.get",
   "sync.apply", "sync.snapshot", "sync.hash", "sync.conflicts",
   "run.job", "script.stage", "inst.transform",
+  "play.hashes",
+  "wait.check",
 ] as const;
 export type OpName = (typeof OP_NAMES)[number];
 
@@ -118,6 +142,8 @@ export interface Bridge {
   sessions(): SessionInfo[];
   /** Subscribe to plugin events; returns unsubscribe. */
   onEvent(fn: (ev: BridgeEvent, from: SessionInfo) => void): () => void;
+  /** Daemon view of the target place (peers, playtest state); absent on bridges without one. */
+  place?(): PlaceState | null;
 }
 
 export type BridgeErrorCode =
@@ -126,7 +152,11 @@ export type BridgeErrorCode =
   | "NOPATH"     // instance path did not resolve
   | "BADARG"     // invalid arguments
   | "AUTH"       // /rpc bearer token missing or wrong
-  | "STUDIO";    // plugin-side execution error
+  | "STUDIO"     // plugin-side execution error
+  | "TARGET"     // target missing, unknown or ambiguous across connected places
+  | "THROTTLED"  // identical poll repeated inside the throttle window
+  | "LEASE"      // playtest owned by another session or started by the user
+  | "VERSION";   // plugin or daemon speaks another protocol version
 
 export class BridgeError extends Error {
   constructor(public code: BridgeErrorCode, message: string) {
@@ -151,8 +181,18 @@ export interface OgsyncConfig {
   };
   daemon: { port: number };
   bind: {
-    /** placeName or placeId the daemon binds ops+sync to; null = first session */
+    /** Default target (alias, placeName or placeId) for this project's sessions; null = the only connected place */
     target_place: string | number | null;
+  };
+  /** [aliases] name = placeName or placeId; usable anywhere a target is. */
+  aliases: Record<string, string>;
+  playtest: {
+    /** Play-mode clients an agent may have running at once. */
+    max_clients: number;
+    /** Agent-started playtests are stopped after this long; 0 disables. */
+    auto_end_s: number;
+    /** A running test without a play-server peer after this long means user plugins are off in test mode. */
+    plugin_grace_s: number;
   };
   sync: {
     enabled: boolean;
@@ -167,6 +207,8 @@ export const CONFIG_DEFAULTS: OgsyncConfig = {
   project: { name: "game", file: "default.project.json" },
   daemon: { port: DEFAULT_PORT },
   bind: { target_place: null },
+  aliases: {},
+  playtest: { max_clients: 2, auto_end_s: 1800, plugin_grace_s: 10 },
   sync: {
     enabled: true,
     conflict: "prefer-newest",
@@ -175,6 +217,52 @@ export const CONFIG_DEFAULTS: OgsyncConfig = {
   },
   update: { auto: true },
 };
+
+// ---------------------------------------------------------------- daemon state (GET /state)
+
+export type PlaytestPhase = "idle" | "starting" | "running" | "stopping" | "unknown";
+
+export interface StaleCode {
+  /** Scripts whose play-server copy differs from the edit DataModel. */
+  changed: number;
+  /** Scripts in the edit DataModel the play server does not have. */
+  missing: number;
+  sample: string[];
+}
+
+export interface PlaytestInfo {
+  state: PlaytestPhase;
+  mode: string | null;
+  /** Client id holding the lease; null when no agent owns the playtest. */
+  owner: string | null;
+  startedBy: "agent" | "user" | null;
+  /** Epoch ms of the last state change. */
+  since: number;
+  /** null until the first plugin heartbeat. */
+  heartbeatAgeMs: number | null;
+  players: number;
+  stale: StaleCode | null;
+  warning: string | null;
+}
+
+export interface PeerState {
+  role: Role;
+  pluginVersion: string;
+  ageMs: number;
+}
+
+export interface PlaceState {
+  key: string;
+  name: string;
+  placeId: number;
+  peers: PeerState[];
+  playtest: PlaytestInfo;
+}
+
+export interface StateResponse {
+  daemon: { version: string; proto: number; pid: number; port: number; startedAt: number };
+  places: PlaceState[];
+}
 
 // ---------------------------------------------------------------- sync
 

@@ -10,7 +10,13 @@ local Dispatcher = require(script.Parent.Dispatcher)
 local Net = require(script.Parent.Net)
 
 local REMOTE_NAME = "__OGSyncBroker"
-local INVOKE_TIMEOUT = 10
+-- Used when a job carries no deadline; otherwise the client gets the daemon's
+-- call timeout minus a margin for the relay back, so long client evals and
+-- nav actions are not cut off at a fixed 10 s.
+local DEFAULT_INVOKE_TIMEOUT = 10
+local MIN_INVOKE_TIMEOUT = 1
+local MAX_INVOKE_TIMEOUT = 600
+local RELAY_MARGIN = 1
 local REMOTE_WAIT = 10
 
 local Broker = {}
@@ -117,6 +123,14 @@ function Broker.startClient()
 	end)
 end
 
+function Broker.invokeTimeout(job: any): number
+	local deadline = if type(job) == "table" then tonumber(job.timeoutMs) else nil
+	if deadline == nil then
+		return DEFAULT_INVOKE_TIMEOUT
+	end
+	return math.clamp(deadline / 1000 - RELAY_MARGIN, MIN_INVOKE_TIMEOUT, MAX_INVOKE_TIMEOUT)
+end
+
 -- Blocks the calling job thread until the client answers or the timeout wins.
 function Broker.toClient(job: any): any
 	local args = if type(job.args) == "table" then job.args :: any else {}
@@ -141,8 +155,9 @@ function Broker.toClient(job: any): any
 		end)
 		settle(if ok then result else { ok = false, err = tostring(result) })
 	end)
-	task.delay(INVOKE_TIMEOUT, function()
-		settle({ ok = false, err = string.format("client did not answer within %ds", INVOKE_TIMEOUT) })
+	local timeout = Broker.invokeTimeout(job)
+	task.delay(timeout, function()
+		settle({ ok = false, err = string.format("client did not answer within %gs", timeout) })
 	end)
 
 	return coroutine.yield()

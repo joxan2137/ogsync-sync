@@ -22,6 +22,7 @@ import { tool as set } from "./set.ts";
 import { tool as sync } from "./sync.ts";
 import { tool as transform } from "./transform.ts";
 import { tool as tree } from "./tree.ts";
+import { tool as wait } from "./wait.ts";
 
 export const TOOLS: readonly ToolModule[] = [
   run,
@@ -45,6 +46,7 @@ export const TOOLS: readonly ToolModule[] = [
   docs,
   history,
   sync,
+  wait,
   job,
   transform,
 ];

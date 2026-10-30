@@ -9,6 +9,7 @@ local RunService = game:GetService("RunService")
 local Applier = require(script.Sync.Applier)
 local Broker = require(script.Broker)
 local Dispatcher = require(script.Dispatcher)
+local Lifecycle = require(script.Lifecycle)
 local Net = require(script.Net)
 local Panel = require(script.UI.Panel)
 local Version = require(script.Version)
@@ -21,8 +22,20 @@ local SETTING_PORT = "ogsync_port"
 local SETTING_ENABLED = "ogsync_enabled"
 local SETTING_STOP_TOKEN = Dispatcher.STOP_SETTING
 
+-- Run mode (F8) simulates inside the edit DataModel, so a plugin (re)loaded
+-- during it is still the edit session. IsRunMode is never true in a play-test
+-- DataModel; it is false under a plugin's RunService:Run() too, which leaves
+-- that rare reload case reading as server rather than risk a play server
+-- registering as a second edit peer.
+local function isRunMode(): boolean
+	local ok, runMode = pcall(function(): boolean
+		return RunService:IsRunMode()
+	end)
+	return ok and runMode == true
+end
+
 local function detectRole(): string
-	if not RunService:IsRunning() then
+	if not RunService:IsRunning() or isRunMode() then
 		return "edit"
 	end
 	return if RunService:IsServer() then "server" else "client"
@@ -45,7 +58,7 @@ local role = detectRole()
 local session = HttpService:GenerateGUID(false)
 local port = readPort()
 local config = {
-	baseUrl = string.format("http://127.0.0.1:%d", port),
+	port = port,
 	session = session,
 	role = role,
 }
@@ -53,6 +66,12 @@ local config = {
 Dispatcher.setup({ plugin = plugin, role = role, session = session })
 
 local cleanups: {() -> ()} = {}
+
+-- Edit and play-server sessions report playtest state; clients have no HTTP.
+local function startLifecycle()
+	Net.setConnectedHook(Lifecycle.connected)
+	table.insert(cleanups, Lifecycle.start({ role = role, pushEvent = Net.pushEvent }))
+end
 
 local function startSync()
 	Applier.onRootsChanged = Watcher.setRoots
@@ -96,6 +115,7 @@ if role == "client" then
 elseif role == "server" then
 	Broker.startHost()
 	Dispatcher.setClientRouter(Broker.toClient)
+	startLifecycle()
 	Net.start(config)
 	table.insert(cleanups, startStopMonitor())
 	table.insert(cleanups, Net.stop)
@@ -124,7 +144,7 @@ else
 
 	local function setPort(newPort: number)
 		plugin:SetSetting(SETTING_PORT, newPort)
-		config.baseUrl = string.format("http://127.0.0.1:%d", newPort)
+		config.port = newPort
 		Panel.setState({ port = newPort })
 		if Net.isRunning() then
 			stopSync()
@@ -148,6 +168,7 @@ else
 	Applier.onSyncState = Panel.setState
 	button.Click:Connect(Panel.toggle)
 
+	startLifecycle()
 	if enabled then
 		startSync()
 	end

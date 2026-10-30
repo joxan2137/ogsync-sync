@@ -20,7 +20,6 @@ export const tool = defineTool({
   description:
     "Capture a Studio viewport as a PNG (context=client during a playtest; edit by default): frame=<path> points the camera at an instance and hide_ui hides ScreenGuis, both always undone after the capture, and size is `WxH` (default 960x540). The result states scale (image px per input px), refuses fast when Studio cannot paint (minimized, covered, locked; restore=true un-minimizes without taking focus), and warns about fullscreen opaque GUIs and AlwaysOnTop billboards the capture can miss.",
   schema: {
-    target: z.enum(["viewport"]).optional(),
     context: z.enum(["edit", "server", "client"]).optional(),
     player: z.union([z.string(), z.number()]).optional(),
     frame: z.string().optional(),
@@ -39,7 +38,7 @@ export const tool = defineTool({
     const data = (await bridge.call(
       "shot.capture",
       {
-        target: args.target ?? "viewport",
+        target: "viewport",
         context,
         player: args.player,
         frame: args.frame ?? args.camera_focus,

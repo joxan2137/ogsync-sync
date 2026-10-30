@@ -13,21 +13,35 @@ AI agent framework for Roblox Studio. One binary, three jobs:
 ## Components
 
 ```
-┌────────────┐ stdio  ┌─────────────────────────────┐  HTTP :3667   ┌──────────────┐
-│ MCP client │───────►│ ogsync daemon                │◄─────────────►│ Studio plugin │
-│ (Claude)   │        │  · MCP server (stdio)        │  long-poll    │  (Luau)       │
-└────────────┘        │  · HTTP hub (localhost only) │               └──────────────┘
-                      │  · sync engine + fs watcher  │
-                      │  · updater (binary + plugin) │
-                      └─────────────────────────────┘
+┌────────────┐ stdio ┌──────────────┐           ┌─────────────────────────────┐  HTTP     ┌──────────────┐
+│ MCP client │──────►│ ogsync serve │──/rpc────►│ ogsync daemon (one/machine) │◄─────────►│ Studio plugin │
+│ (Claude)   │       │ thin proxy   │  node:http│  · HTTP hub, every place     │ long-poll │ (edit, server │
+└────────────┘       └──────────────┘           │  · tools execute here        │           │  per place)   │
+┌────────────┐                                  │  · sync engine per project   │           └──────────────┘
+│ shell/hook │── ogsync call / status ─────────►│  · playtest state + leases   │
+└────────────┘                                  └─────────────────────────────┘
 ```
 
-- **Single process.** `ogsync serve` runs MCP-over-stdio, the HTTP hub, and the
-  sync engine together. `--no-mcp` for sync-only use.
-- **Port 3667** (configurable, `OGSYNC_PORT`). Bound to 127.0.0.1 only.
-- **Second-instance handling:** if the port is taken and `/health` identifies an
-  ogsync daemon, the new process becomes a thin proxy: MCP tool calls forward to
-  the running daemon over HTTP. Two Claude sessions can share one Studio.
+- **One daemon per machine, outliving sessions.** `ogsync serve` (what each
+  Claude session runs) never owns the bridge: it ensures the daemon is up
+  (spawning `ogsync daemon run` detached through a short-lived `daemon detach`
+  hop, so a Windows process-tree kill of the session cannot reach it; guarded
+  by `~/.ogsync/daemon.lock`) and forwards every MCP tool call over `POST /rpc`. A session ending, or
+  crashing, leaves Studio connected for everyone else. The daemon serves
+  every place at once; peers are keyed by place key + role.
+- **Uniform clients.** Sessions, `ogsync call <tool> '<json>'` (agents with
+  only a shell) and `ogsync status [--json]` (hooks) all speak the same
+  `/rpc`/`/state` surface. Tools execute in the daemon, so partial results and
+  plugin events reach them directly; clients relay only the final
+  `CallToolResult` (MCP progress notifications are not forwarded).
+- **Ports.** The daemon binds the first free port of a fixed candidate list,
+  skipping Windows excluded port ranges, and publishes it in
+  `~/.ogsync/daemon.json`; the plugin scans the same list
+  (docs/PROTOCOL.md § Ports and discovery). Bound to 127.0.0.1 only.
+- **Per-project state.** Each call carries its client id and working
+  directory; that directory's ogsync.toml supplies the default target,
+  `[aliases]` and `[playtest]` limits, and the daemon runs one sync engine per
+  attached project directory.
 
 ## Bridge protocol (daemon ⇄ plugin)
 
@@ -46,13 +60,26 @@ Op execution on the plugin side is a dispatcher: `Ops/<Domain>.luau` modules
 keyed by op name. One job queue, results correlated by id. Long ops (playtest,
 profiling) stream partial results via events.
 
-**Session binding:** multiple Studio instances may connect (one session each).
-The daemon binds MCP ops and sync to exactly one session — chosen by
-`target_place` in `ogsync.toml` (matches placeName or placeId) or, when unset,
-the first connected session. Ops are never broadcast to all sessions. If the
-bound session is absent, tools return `ERR NOPLUGIN` rather than falling back
-to a different Studio instance. (Dev/testing on this machine: `target_place`
-must be `"Place2"`.)
+**Targeting:** every place that connects is served. Each tool call resolves a
+`target` (`<alias|key|placeId|name>[:edit|server|client-N]`, default
+`bind.target_place` of the caller's ogsync.toml) to exactly one place; with
+several candidates and no target, or an ambiguous one, it answers `ERR
+TARGET` with the list — never "first connected". Sync follows the same rule.
+Ops are never broadcast. (Dev/testing on this machine: `target_place` must be
+`"Place2"`.)
+
+**Fairness and survival:** ops to one place run one at a time, round-robin
+across calling sessions; status polls repeated within 1 s are throttled. A
+plugin reconnect does not lose calls: the same session re-handshaking gets its
+unanswered jobs again (its job log skips ones it ran), and a dropped peer's
+calls wait 30 s for the place to re-attach.
+
+**Playtest lifecycle:** a per-place state machine fed by plugin heartbeats
+(`unknown` when they stop), leases recorded on start (stop by another session,
+or of a user-started test, needs `force`), client cap and auto-end from
+`[playtest]`, stale-code detection by comparing play-server and edit script
+hashes, and a warning when "Load User Plugins in Test Mode" looks off. `GET
+/state` exposes all of it without auth for hooks that must fail closed.
 
 ## MCP tool surface (~20 tools)
 
@@ -153,6 +180,10 @@ portable between sync files and tool output.
   (`@modelcontextprotocol/server`) stabilizes 2026-07-28 with unverified host
   support — migrate later via codemod. stdout is JSON-RPC only: all logging to
   stderr, EPIPE guard on stdout writes.
+- **Local clients:** node:http with `agent: false` + `connection: close`, never
+  fetch/undici keep-alive (short-lived Windows processes asserted on exit with
+  pooled sockets); loopback is added to `NO_PROXY` because Bun applies
+  `HTTP(S)_PROXY` to 127.0.0.1 as well.
 - **HTTP hub:** `Bun.serve` (native), not node:http (Bun buffers outgoing
   request bodies; irrelevant for serve but avoid the module wholesale).
 - **Plugin embedding:** `import pluginRbxm from "../assets/OGSync.rbxm" with
@@ -177,9 +208,10 @@ portable between sync files and tool output.
 
 ```
 server/           TypeScript (Bun) — CLI, MCP, hub, sync, updater
-  src/index.ts        CLI entry (serve, init, update, plugin, status)
+  src/index.ts        CLI entry (serve, daemon, call, status, init, update, plugin, doctor)
+  src/daemon/         daemon lock + daemon.json, port choice, node:http client, per-project state
   src/mcp/            MCP server + tools/<name>.ts (one module per tool)
-  src/hub/            HTTP hub, job queue, long-poll, session mgmt
+  src/hub/            HTTP hub, places + peers, fair scheduler, playtest tracker, targets
   src/sync/           project mapping, watcher, shadow store, conflict
   src/update/         github releases client, self-replace, plugin installer
   src/window/         Studio window state (Win32 via Bun FFI): checkVisual pre-flight
