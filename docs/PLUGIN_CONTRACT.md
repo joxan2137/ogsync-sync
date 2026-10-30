@@ -19,7 +19,9 @@ plugin/src/
   Util/Output.luau        core  size-capped list/table builders
   Ops/Inst.luau           ops   inst.get/set/create/delete/duplicate/find/tree
   Ops/Script.luau         ops   script.read/edit/grep
-  Ops/Run.luau            ops   run.exec (edit ctx direct; server/client via daemon routing)
+  Ops/Run/init.luau       ops   run.exec + run.job (plugin VM for edit; game VM for server/client)
+  Ops/Run/Jobs.luau       ops   eval job registry: generations, supersede-by-key, guarded timers
+  Ops/Run/Bridge.luau     ops   game-VM eval host — cloned into the play DataModel, never required by the plugin
   Ops/Play.luau           ops   play.start/stop/status
   Ops/Log.luau            ops   log.tail + log event forwarding
   Ops/Shot.luau           ops   shot.capture
@@ -29,6 +31,9 @@ plugin/src/
   Ops/Rbxm.luau           ops   rbxm.export/import (base64 payloads)
   Ops/Hist.luau           ops   hist.op (undo/redo/waypoint)
   Ops/Sel.luau            ops   sel.get + selection events
+  Util/Source.luau        ops   script text transport: base64, staged uploads, verified writes
+  Util/Recording.luau     ops   one ChangeHistoryService recording per write op
+  Util/Transform.luau     ops   transform planning from original pivots
 ```
 
 "core" = plugin-core agent; "ops" = ops agent. Ops modules must not require
@@ -99,14 +104,41 @@ Net.pushPartial(jobId: string, data: any)
   edits (TextDocumentDidChange only fires for locally open documents) and
   `GetPropertyChangedSignal("Name")`/`AncestryChanged` for renames/moves.
   Only LuaSourceContainers + Folders under synced roots produce events.
-- **run.exec** (edit ctx): `loadstring` the code chunk; sandbox output capture
-  by shadowing `print/warn/error` via `setfenv`; collect return values through
-  `table.pack`; encode via Serde with depth cap 4; cap combined output at
-  100 kB before Output.capList. Errors → `error()` with traceback line.
+- **run.exec** (edit ctx, or `vm="plugin"`): `loadstring` the code chunk;
+  sandbox output capture by shadowing `print/warn/error` via `setfenv`; collect
+  return values through `table.pack`; encode via Serde with depth cap 4; cap
+  combined output at 100 kB before Output.capList. Errors → `error()` with
+  traceback line and ` [vm=…]`. Every eval is a job in `Ops/Run/Jobs`; the
+  sandbox exposes `ogsync` (`id`, `gen`, `key`, `alive()`, `delay()`).
+- **run.exec** (server/client ctx, default `vm="game"`): once per play
+  DataModel, inject `__OGSyncEval` — a `Script` in ServerScriptService (server)
+  or a `LocalScript` in the local player's PlayerScripts (client), Archivable
+  false, attribute `Proto`, children `Bridge`/`Serde`/`Path` (clones of the
+  plugin's modules) and `BindableFunction Invoke` — with Source
+  `require(script.Bridge)(script, require(script.Serde))`, and wait up to 5 s for
+  its `Ready` attribute. Each eval writes the code into a fresh ModuleScript as
+  `return function(print, warn, ogsync, ...) <code>\nend` (same first line, so
+  error line numbers match), and the bridge clones and `require`s it from the
+  game VM, so the code shares the game's require cache without `loadstring`.
+  Roblox limits: this relies on Studio compiling plugin-set `Source` for
+  scripts created during a playtest (published games never do); if the bridge
+  never reports Ready the op fails with `game-VM eval unsupported` and does not
+  fall back to the plugin VM. Client-context jobs ride the existing broker,
+  whose relay gives up after 10 s, so long client evals must be async. Output
+  capture covers the eval's own `print`/`warn` (shadowed parameters), not
+  prints from modules it requires.
+- **Write ops** run inside `Util/Recording.run` (one undo step; Cancel on
+  throw). Script text goes through `Util/Source`: `take` (decode + hash check),
+  `write` (`UpdateSourceAsync`, then read back via `GetEditorSource` when a
+  document is open, else `Source`, and compare hashes).
 - **shot.capture**: try `CaptureService:CaptureScreenshot` → contentId →
   `AssetService:CreateEditableImageAsync` → `ReadPixels` → return
   `{w, h, rgba: base64}`. Any step unsupported in current context →
   error("screenshot unsupported: <step>"). Daemon converts RGBA→PNG.
+  `frame` and `hide_ui` register restore functions that run (pcall'd, in
+  reverse) after the capture whether it succeeded or not. The capture callback
+  wait is short (default 4 s) and its timeout error names the cause: the
+  viewport is not painting.
 - **JSON safety**: results must be JSONEncodable — Serde.encode everything;
   `nil`s in arrays forbidden (use false/omit).
 - **No busy loops**: all polling via `task.wait`, heartbeat-driven; Net pull
