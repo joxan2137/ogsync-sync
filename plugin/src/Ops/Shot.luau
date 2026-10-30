@@ -22,7 +22,15 @@ local OPAQUE_BELOW = 0.05
 local GUI_SCAN_CAP = 5000
 local WORLD_SCAN_CAP = 200000
 local YIELD_EVERY = 5000
-local MAX_RAW_BYTES = 512 * 1024
+-- Output sizes past this are clamped (and say so): 1920x1080 is ~11 MB of
+-- base64, already ~15 chunked round trips.
+local MAX_OUTPUT_PIXELS = 1920 * 1080
+-- Base64 chars per result, a multiple of 4, under the 1 MB result cap.
+local PIXEL_CHUNK_CHARS = 768 * 1024
+
+-- Only the latest capture's remaining chunks are kept.
+local storedPixels: { id: string, data: string, chunks: number }? = nil
+local pixelsSerial = 0
 local B64_GROUPS_PER_CHUNK = 4096
 
 local B64_CHARS: { string } = {}
@@ -358,24 +366,28 @@ local function readImage(args: any, image: any): any
 	end
 
 	local readPixel = pixelReader(image, width, height)
+	-- Fit inside the requested box keeping the aspect ratio; never upscale.
 	local wantWidth, wantHeight = parseSize(args.size)
-	local stride = 1
+	local fit = 1
 	if wantWidth and wantHeight then
-		stride = math.max(math.ceil(math.max(width / wantWidth, height / wantHeight)), 1)
+		fit = math.min(wantWidth / width, wantHeight / height, 1)
 	end
-	-- Keep the base64 payload under the 1 MB wire cap by dropping rows/columns.
-	while math.ceil(width / stride) * math.ceil(height / stride) * 4 > MAX_RAW_BYTES do
-		stride += 1
+	local clamped = false
+	if width * height * fit * fit > MAX_OUTPUT_PIXELS then
+		fit = math.sqrt(MAX_OUTPUT_PIXELS / (width * height))
+		clamped = true
 	end
 
-	local outWidth = math.ceil(width / stride)
-	local outHeight = math.ceil(height / stride)
+	local outWidth = math.max(math.floor(width * fit + 0.5), 1)
+	local outHeight = math.max(math.floor(height * fit + 0.5), 1)
+	local stepX = width / outWidth
+	local stepY = height / outHeight
 	local bytes = buffer.create(outWidth * outHeight * 4)
 	local offset = 0
 	for y = 0, outHeight - 1 do
-		local sourceY = math.min(y * stride, height - 1)
+		local sourceY = math.min(math.floor((y + 0.5) * stepY), height - 1)
 		for x = 0, outWidth - 1 do
-			local r, g, b, a = readPixel(math.min(x * stride, width - 1), sourceY)
+			local r, g, b, a = readPixel(math.min(math.floor((x + 0.5) * stepX), width - 1), sourceY)
 			buffer.writeu8(bytes, offset, r)
 			buffer.writeu8(bytes, offset + 1, g)
 			buffer.writeu8(bytes, offset + 2, b)
@@ -387,12 +399,21 @@ local function readImage(args: any, image: any): any
 		end
 	end
 
+	-- Pixels larger than one result (1 MB wire cap) are fetched in chunks:
+	-- the first rides here, the rest come from shot.read {pixels, chunk}.
+	local encoded = base64(bytes)
+	local chunks = math.max(math.ceil(#encoded / PIXEL_CHUNK_CHARS), 1)
+	pixelsSerial += 1
+	local id = tostring(pixelsSerial)
+	storedPixels = if chunks > 1 then { id = id, data = encoded, chunks = chunks } else nil
 	return {
 		w = outWidth,
 		h = outHeight,
-		rgba = base64(bytes),
+		rgba = string.sub(encoded, 1, PIXEL_CHUNK_CHARS),
+		chunks = chunks,
+		pixels = id,
 		source = { w = width, h = height },
-		stride = stride,
+		clamped = if clamped then MAX_OUTPUT_PIXELS else nil,
 	}
 end
 
@@ -475,6 +496,21 @@ return function(register: Register)
 	end)
 
 	register("shot.read", function(args: any): any
+		if args.pixels ~= nil then
+			local stored = storedPixels
+			local chunk = tonumber(args.chunk)
+			if stored == nil or stored.id ~= tostring(args.pixels) then
+				error("capture " .. tostring(args.pixels) .. " is gone (a newer capture replaced it); take the screenshot again")
+			end
+			if chunk == nil or chunk < 1 or chunk > stored.chunks then
+				error(string.format("chunk must be 1..%d", stored.chunks))
+			end
+			if chunk == stored.chunks then
+				storedPixels = nil
+			end
+			local first = (chunk - 1) * PIXEL_CHUNK_CHARS + 1
+			return { rgba = string.sub(stored.data, first, first + PIXEL_CHUNK_CHARS - 1) }
+		end
 		if type(args.contentId) ~= "string" then
 			error("shot.read needs the contentId a play-context shot.capture returned")
 		end

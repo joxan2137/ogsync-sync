@@ -10,6 +10,10 @@ interface ShotResult {
   h?: number;
   rgba?: string;
   contentId?: string;
+  chunks?: number;
+  pixels?: string;
+  /** Pixel cap the requested size was clamped to. */
+  clamped?: number;
   scale?: number;
   viewport?: { w: number; h: number };
   inset?: { x: number; y: number };
@@ -30,7 +34,7 @@ export function isBlackFrame(rgba: Buffer): boolean {
 export const tool = defineTool({
   name: "screenshot",
   description:
-    "Capture a Studio viewport as a PNG (context=client during a playtest; edit by default): frame=<path> points the camera at an instance and hide_ui hides ScreenGuis, both always undone after the capture, and size is `WxH` (default 960x540). The result states scale (image px per input px), refuses fast when Studio cannot paint (minimized, covered, locked; restore=true un-minimizes without taking focus), and warns about fullscreen opaque GUIs and AlwaysOnTop billboards the capture can miss.",
+    "Capture a Studio viewport as a PNG (context=client during a playtest; edit by default): frame=<path> points the camera at an instance and hide_ui hides ScreenGuis, both always undone after the capture, and size is the `WxH` box the image fits into (default 960x540, aspect kept, at most 1920x1080 pixels). The result states scale (image px per input px), refuses fast when Studio cannot paint (minimized, covered, locked; restore=true un-minimizes without taking focus), and warns about fullscreen opaque GUIs and AlwaysOnTop billboards the capture can miss.",
   schema: {
     context: z.enum(["edit", "server", "client"]).optional(),
     player: z.union([z.string(), z.number()]).optional(),
@@ -74,7 +78,18 @@ export const tool = defineTool({
     }
 
     if (!data.rgba || !data.w || !data.h) throw badArg("plugin returned no pixels");
-    const rgba = Buffer.from(data.rgba, "base64");
+    // Pixels over one result's 1 MB cap stay in the edit session and arrive in
+    // chunks; every read of pixels (edit captures and play read-backs) is there.
+    const parts = [data.rgba];
+    for (let chunk = 2; chunk <= (data.chunks ?? 1); chunk++) {
+      const part = (await bridge.call("shot.read", { pixels: data.pixels, chunk }, callOpts(args, LONG_TIMEOUT_MS))) as ShotResult;
+      if (!part.rgba) throw badArg(`plugin returned no pixels for chunk ${chunk}`);
+      parts.push(part.rgba);
+    }
+    const rgba = Buffer.from(parts.join(""), "base64");
+    if (rgba.length !== data.w * data.h * 4) {
+      throw badArg(`pixel data is ${rgba.length}B, expected ${data.w * data.h * 4}B for ${data.w}x${data.h}`);
+    }
     const png = encodePng(data.w, data.h, rgba);
     const head = row(`${context} ${data.w}x${data.h} png ${png.length}B`, {
       viewport: data.viewport && `${Math.round(data.viewport.w)}x${Math.round(data.viewport.h)}`,
@@ -85,7 +100,10 @@ export const tool = defineTool({
     const black = isBlackFrame(rgba)
       ? ["capture is a fully black frame: CaptureService missed the renderer (seen with some renderers during playtests)"]
       : [];
-    const notes = [...visual.warnings, ...(data.warnings ?? []), ...black].map((w) => `warn: ${w}`);
+    const clamped = data.clamped
+      ? [`size ${size} exceeds the ${data.clamped}-pixel cap; clamped to ${data.w}x${data.h}`]
+      : [];
+    const notes = [...visual.warnings, ...(data.warnings ?? []), ...clamped, ...black].map((w) => `warn: ${w}`);
     return {
       content: [
         { type: "image" as const, data: png.toString("base64"), mimeType: "image/png" },

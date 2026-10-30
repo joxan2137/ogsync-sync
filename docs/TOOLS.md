@@ -257,7 +257,9 @@ the play client during a playtest, `server` the play server), `player?`,
 `camera_focus` is an alias), `hide_ui?` (play client: disables the enabled
 PlayerGui ScreenGuis; edit: turns off `StarterGui.ShowDevelopmentGui`, Studio's
 own UI toggle, so no ScreenGui in the place is touched), `restore?` (see
-visual pre-flight), `size?` (`WxH`, default 960x540), `capture_timeout_ms?`
+visual pre-flight), `size?` (`WxH` box the image is scaled to fit, aspect
+kept, never upscaled; default 960x540; capped at 1920x1080 = 2,073,600 pixels,
+and a clamped size says so in a `warn:` line), `capture_timeout_ms?`
 (default 4000, max 30000). Camera (CFrame, Focus, FieldOfView, CameraType) and
 UI state are restored after every capture, including failed ones.
 Returns the image plus
@@ -272,7 +274,8 @@ with the reason (viewport not painting) instead of hanging.
 Play captures take two steps: the play DataModel captures (CaptureService) and
 returns only the temporary content id, because a running game may not turn a
 temporary texture into an EditableImage; the edit DataModel, which may, reads
-the pixels (`shot.read`). A fully black result adds
+the pixels (`shot.read`). Pixels larger than one 1 MB result stay in the edit
+session and are fetched in 768 KiB base64 chunks. A fully black result adds
 `warn: capture is a fully black frame` (CaptureService misses the renderer on
 some Studio builds during playtests).
 

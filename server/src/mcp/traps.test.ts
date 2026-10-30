@@ -207,6 +207,37 @@ describe("visual tools", () => {
     expect(calls[0]!.args).toMatchObject({ context: "edit", frame: "game.Workspace.Hut", hide_ui: true, content_only: false });
   });
 
+  test("pixels over one result are fetched in chunks from the edit session", async () => {
+    const full = Buffer.alloc(640 * 360 * 4, 120).toString("base64");
+    const half = full.length / 2;
+    const { bridge, calls } = recordingBridge((op, args) =>
+      op === "shot.capture"
+        ? { w: 640, h: 360, rgba: full.slice(0, half), chunks: 2, pixels: "9", viewport: { w: 1920, h: 1080 }, scale: 1 / 3 }
+        : { rgba: args["chunk"] === 2 ? full.slice(half) : "" },
+    );
+    const text = await call(bridge, "screenshot", { size: "640x360" });
+    expect(text).toMatch(/^edit 640x360 png \d+B\tviewport=1920x1080 scale=0\.333$/);
+    expect(calls.map((c) => [c.op, c.args["chunk"]])).toEqual([["shot.capture", undefined], ["shot.read", 2]]);
+    expect(calls[1]!.args).toEqual({ pixels: "9", chunk: 2 });
+  });
+
+  test("a size over the pixel cap says it was clamped", async () => {
+    const { bridge } = recordingBridge(() => ({
+      w: 2,
+      h: 1,
+      rgba: Buffer.alloc(8, 99).toString("base64"),
+      clamped: 2_073_600,
+    }));
+    expect(await call(bridge, "screenshot", { size: "4000x3000" })).toContain(
+      "warn: size 4000x3000 exceeds the 2073600-pixel cap; clamped to 2x1",
+    );
+  });
+
+  test("short pixel data is an error, not a corrupt PNG", async () => {
+    const { bridge } = recordingBridge(() => ({ w: 4, h: 4, rgba: Buffer.alloc(8, 99).toString("base64") }));
+    expect(await call(bridge, "screenshot", {})).toStartWith("ERR BADARG: pixel data is 8B, expected 64B");
+  });
+
   test("client screenshot captures on the client and reads the pixels in edit", async () => {
     const { bridge, calls } = recordingBridge((op) =>
       op === "shot.capture"

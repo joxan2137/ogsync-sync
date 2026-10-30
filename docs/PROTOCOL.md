@@ -358,11 +358,16 @@ in edit mode so Undo can restore it.
 ## Capture and input
 
 - `shot.capture {target, context, player?, frame?, camera_focus?, hide_ui?, size,
-  capture_timeout_ms?}` → `{w, h, rgba, source: {w, h}, stride, viewport: {w, h},
+  capture_timeout_ms?}` → `{w, h, rgba, chunks, pixels, clamped?, source: {w, h}, viewport: {w, h},
   inset: {x, y}, scale, warnings: [string]}`. `scale = w / viewport.w`.
   `content_only: true` (used for play contexts) stops after the capture and
   answers `{contentId, viewport, inset, warnings}`.
-- `shot.read {contentId, size}` → `{w, h, rgba, source, stride}`; sent to the
+  `w`x`h` fits inside `size` with the aspect kept (nearest-neighbour, never
+  upscaled, at most 2,073,600 pixels; `clamped` carries that cap when hit).
+  `rgba` is the first chunk of the base64 pixels (768 KiB of chars); when
+  `chunks > 1` the rest come from `shot.read {pixels, chunk: 2..chunks}` in the
+  session that read the image (always edit). Only the latest capture is kept.
+- `shot.read {contentId, size}` → the same pixel shape; sent to the
   edit session, which can promote a temporary texture captured in a play
   DataModel to an EditableImage (the play DataModel cannot).
 - `wait.check {kind, path, name?, value?, context, player?}` routes like the
