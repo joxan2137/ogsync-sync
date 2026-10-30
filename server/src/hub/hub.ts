@@ -51,7 +51,10 @@ const PLUGIN_ROUTES: ReadonlySet<string> = new Set([
 ]);
 
 /** Ops whose args select a play-mode context; those go to the play-server session. */
-const RUNTIME_CONTEXT_OPS: ReadonlySet<OpName> = new Set<OpName>(["run.exec", "log.tail"]);
+const RUNTIME_CONTEXT_OPS: ReadonlySet<OpName> = new Set<OpName>([
+  "run.exec", "log.tail",
+  "run.job", "input.batch", "shot.capture",
+]);
 
 const PLUGIN_ERROR_CODES = ["NOPLUGIN", "TIMEOUT", "NOPATH", "BADARG", "STUDIO"] as const satisfies readonly BridgeErrorCode[];
 
