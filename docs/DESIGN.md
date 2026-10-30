@@ -214,6 +214,7 @@ server/           TypeScript (Bun) — CLI, MCP, hub, sync, updater
   src/hub/            HTTP hub, places + peers, fair scheduler, playtest tracker, targets
   src/sync/           project mapping, watcher, shadow store, conflict
   src/update/         github releases client, self-replace, plugin installer
+  src/window/         Studio window state (Win32 via Bun FFI): checkVisual pre-flight
   src/proto/          shared types, property serde, path grammar
 plugin/           Luau — Studio plugin (built with rojo)
   default.project.json

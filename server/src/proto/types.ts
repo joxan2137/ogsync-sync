@@ -60,6 +60,8 @@ export interface Job {
   id: string;
   op: OpName;
   args: unknown;
+  /** The daemon's deadline for this call; plugin-side waits (client broker) size themselves to it. */
+  timeoutMs?: number;
 }
 
 export interface PullResponse {
@@ -115,6 +117,7 @@ export const OP_NAMES = [
   "hist.op",
   "sel.get",
   "sync.apply", "sync.snapshot", "sync.hash", "sync.conflicts",
+  "run.job", "script.stage", "inst.transform",
   "play.hashes",
   "wait.check",
 ] as const;

@@ -24,12 +24,63 @@ Conventions used by every tool:
   call <tool> '<json>'` (shell) are both thin clients of it, so every agent
   sees the same places, queue and leases. Ops to one place run one at a time,
   round-robin across sessions.
+- **Writes are one undo step** — `set`, `create`, `delete`, `duplicate`,
+  `edit`, `grep replace` and `transform` each run inside one
+  `ChangeHistoryService` recording. A call that throws part-way cancels its
+  recording, which rolls the partial write back. Outside edit mode (or while
+  another plugin holds a recording) the write still happens, ungrouped.
+- **Visual pre-flight (Windows)** — `screenshot` and the key/click/move/scroll
+  actions of `input` first check the bound place's Studio window. They refuse
+  fast with the reason when it cannot paint: session locked, window minimized,
+  on another virtual desktop, or ≥95% covered by windows above it (click-through
+  overlays and Studio's own panels do not count). `restore=true` restores a
+  minimized window with `SW_SHOWNOACTIVATE`, which never takes focus. A
+  foreground `RobloxPlayerBeta` adds a warning: the user's real mouse and keys
+  can reach the play client. No Studio window found, or another OS, means the
+  check is skipped with a warning, never a refusal.
 
 ## run
 Execute Luau. `code` (string, required), `context` (`edit`|`server`|`client`,
 default `edit`; server/client require active playtest), `player` (name/index for
 client context). Returns print output + serialized return values (tables
 rendered compactly, depth-capped at 4, 2000-char cap with `…`).
+
+- `vm` (`game`|`plugin`) — server/client code runs in the **game VM** by
+  default: it requires the same module instances the game's scripts do, so a
+  second `DataService`, duplicate packet handlers or non-replicating writes
+  cannot happen. `vm=plugin` evaluates in the plugin's own VM (separate
+  require cache); such results start with
+  `[vm=plugin: separate require cache, not the game's module instances]`.
+  `context=edit` always uses the plugin VM (there is no game VM in edit);
+  `vm=game` there is `ERR BADARG`.
+- `async=true` — returns `job <handle> started vm=… gen=…` at once; poll,
+  collect or cancel it with `job`. Async jobs have no call timeout.
+- `key` — starting a job with the key of a previous job cancels that job and
+  makes it stale. Code sees an `ogsync` table: `id`, `gen`, `alive()` (false
+  once cancelled or superseded) and `delay(seconds, fn, ...)`, a `task.delay`
+  that does nothing if the job is no longer current. Use it for samplers and
+  watchdogs so an old timer cannot stop a re-armed one.
+- Limits: a synchronous `context=client` eval is relayed by the play server
+  over a RemoteFunction that gives up after 10 s; use `async=true` for longer
+  client work. Game-VM eval needs Studio to run scripts created at runtime (see
+  PLUGIN_CONTRACT.md); when it cannot, the call fails with
+  `game-VM eval unsupported: …` rather than silently using the plugin VM.
+
+## job
+Async eval jobs from `run async=true`. `action`: `poll` (default — status and
+output so far, job kept), `collect` (waits up to `wait_ms`, default 10000, then
+returns the result and forgets a finished job; a still-running job answers
+`still running; collect again`), `cancel`, `list` (jobs in `context`).
+`handle` is what `run` printed: `edit:3.<nonce>`, `server:7.<nonce>` or
+`client@Player1:2.<nonce>` — it names the session that owns the job, and the
+nonce identifies that session's job registry: ids restart at 1 in every play
+DataModel, so a handle from an earlier playtest is refused with
+`job N is from an earlier playtest or plugin load` instead of reaching a
+different job. Client collects
+wait at most 8000 ms per call (broker relay cap). Finished, uncollected jobs are
+kept per session, newest 32. Output:
+`job <handle> <status><TAB>vm=… gen=… elapsed_s=…` then output, `=> returns`, and
+`ERR <reason>` for failed or cancelled jobs.
 
 ## read
 `path` (script), `offset` (1-based line, default 1), `limit` (default 200).
@@ -40,7 +91,17 @@ Script editing, three modes (exactly one):
 - `old`/`new` string replace (must match exactly once; `all=true` for every match)
 - `lines={start,end?}` + `new` — replace/delete (`new=""`) line range; `insert_after=N` + `new` — insert
 - `source` — full overwrite (creates script if missing with `class`, default ModuleScript)
-Returns `ok <path> <newLineCount>L <hash8>` + ±3 context lines around the change.
+Returns `ok <path> <newLineCount>L <hash8> verified` + ±3 context lines around
+the change (`verified(editor)` when the script was open in a Script Editor tab).
+
+All text (`old`, `new`, `source`) is LF-normalized and sent as base64 of its
+UTF-8 bytes, so NULs, lone CRs and long brackets arrive intact; a source over
+64 KiB of base64 is staged in chunks first, so there is no size ceiling. The
+plugin checks the decoded text against the daemon's hash, writes through
+`ScriptEditorService:UpdateSourceAsync` (which merges into an open editor
+document instead of being overridden by it), then reads the result back —
+`GetEditorSource` when a document is open, `Source` otherwise — and fails if
+its hash differs.
 
 ## grep
 `pattern` (Lua string patterns off; RE2-style regex), `root` (path, default
@@ -59,14 +120,25 @@ children are skipped.
 `paths` (array), `props` (names array, or `*` for all non-default, default:
 class-typical summary set), `attrs` (bool|names), `tags` (bool), `refs` (bool —
 incoming/outgoing ObjectValue/weld/attachment references). Output per instance:
-`path (Class)` then `  prop=value` lines. Special: `get game` includes place
+`path (Class)` then `  prop=value` lines. The summary set covers UI fully:
+`AbsolutePosition`/`AbsoluteSize`, `AnchorPoint`, `AutomaticSize`, `LayoutOrder`,
+`SizeConstraint`, text `FontFace`/`LineHeight`, image `SliceCenter` (Rect),
+ScreenGui `DisplayOrder`/`ScreenInsets`, and every UI layout, constraint and
+modifier class (UIListLayout incl. flex, UIGridLayout, UITableLayout,
+UIPageLayout, UIAspectRatio/Size/TextSize constraints, UICorner, UIStroke,
+UIGradient with ColorSequence/NumberSequence, UIScale, UIFlexItem). Values:
+`UDim2 [[sx,ox],[sy,oy]]`, `Vector2 [x,y]`, `Rect [[minx,miny],[maxx,maxy]]`,
+`ColorSequence [{time,color}]`, `NumberSequence [{time,value,envelope}]`, enums
+`"Enum.X.Y"`, `Font {family,weight,style}`, `Content` as its URI. Special: `get game` includes place
 id/name/game settings summary.
 
 ## set
 `targets`: array of `{path|paths, props?, attrs?, tags_add?, tags_remove?,
 name?, parent?}`. Setting `attrs.X=null` deletes attribute X. `parent` moves the
-instance (covers reparent op of manage_instance). Batch, transactional per
-target, one undo waypoint for the call. Returns `ok N instances, M properties`.
+instance (covers reparent op of manage_instance). Batch, one undo step for the
+call. `props.Source` on a script takes the same binary-safe, staged,
+hash-verified path as `edit` and adds a `<path><TAB>source=<hash8> verified=editor|source`
+row. Returns `ok N instances, M properties`.
 
 ## create
 `items`: array of `{class, parent, name?, props?, attrs?, tags?, children?}`
@@ -75,12 +147,36 @@ copy) on any item for mass creation. Returns created paths (grouped/compacted
 for mass: `parent.Name[1..50]`).
 
 ## delete
-`paths` (array). Returns `ok N deleted`. Refuses services.
+`paths` (array). Returns `ok N deleted`. Refuses services. In edit mode
+instances are detached (`Parent = nil`) inside the call's recording, the way
+Studio's own Delete works, so Undo restores them; `Destroy()` would lock
+`Parent` and make the delete permanent. Play-mode deletes still `Destroy()`.
 
 ## duplicate
 `path`, `count` (default 1), `parent?`, `name?` (`{n}` placeholder),
 `offset?` (CFrame/Vector3 per copy), `props_per_copy?` (array of prop overrides).
 Covers smart/mass duplicate. Returns created paths compacted.
+
+## transform
+Move/rotate many Models and BaseParts as one undo step. `targets`: array of
+`{path|paths, move?: [x,y,z], rotate?: [rx,ry,rz] (degrees, Y-X-Z like
+Orientation), origin?: "pivot"|"center"|[x,y,z], to?: [x,y,z] | 12-number CFrame}`
+— `to` sets an absolute pivot (a position keeps the current rotation) and
+cannot be combined with `move`/`rotate`. `origin=pivot` (default) rotates each
+instance about its own pivot, `center` about the centroid of the target's
+pivots. `dry_run=true` returns the plan without writing.
+
+Every target pivot is computed from the **original** pivots before anything
+moves, then applied with `PivotTo` (never by writing `WorldPivot`). Moving one
+member of a welded assembly drags its partners; precomputed absolute targets
+mean nothing compounds. An instance under a listed **Model** is skipped
+(`skip <path> (moves with <ancestor>)`), since Model:PivotTo carries its
+descendants; a part under a listed BasePart still gets its own step, because
+BasePart:PivotTo moves only that part and what is welded to it. After applying, any instance more than
+0.001 studs off its target (dragged by a weld to something moved later) is
+reported as an `ERR` line.
+Output: `ok N moved` or `dry-run N planned`, then
+`<path><TAB>from=[x,y,z] to=[x,y,z] rot=[from]→[to]` rows.
 
 ## find
 `root` (default `@game`), `class?` (with `inherit=true` default),
@@ -137,8 +233,24 @@ starting at 500 ms and backing off ×1.5 to every 4 s (Studio's HttpService
 budget). Returns `wait ok: …`, or `ERR TIMEOUT: …` naming the last state seen.
 
 ## screenshot
-`target` (`viewport` default), `camera_focus?` (path — frame instance before
-capture), `size?` (`WxH`, default 960x540). Returns image (MCP image content).
+Always the viewport (the shared `target` arg picks the place, as for every
+tool). `context` (`edit` default; `client` captures
+the play client during a playtest, `server` the play server), `player?`,
+`frame?` (path — point the camera at a Model/BasePart/Attachment;
+`camera_focus` is an alias), `hide_ui?` (play client: disables the enabled
+PlayerGui ScreenGuis; edit: turns off `StarterGui.ShowDevelopmentGui`, Studio's
+own UI toggle, so no ScreenGui in the place is touched), `restore?` (see
+visual pre-flight), `size?` (`WxH`, default 960x540), `capture_timeout_ms?`
+(default 4000, max 30000). Camera (CFrame, Focus, FieldOfView, CameraType) and
+UI state are restored after every capture, including failed ones.
+Returns the image plus
+`<context> WxH png NB<TAB>viewport=WxH scale=S inset=X,Y`: `scale` is image pixels
+per viewport pixel — divide an image coordinate by it to get the x/y `input`
+expects; `inset` is the top-bar GUI inset. `warn:` lines report a fullscreen
+opaque GuiObject covering the 3D view (only checked when `hide_ui` is off),
+`AlwaysOnTop` BillboardGui/SurfaceGui present (CaptureService captures can omit
+them), and pre-flight warnings. A capture that does not arrive in time fails
+with the reason (viewport not painting) instead of hanging.
 
 ## profile
 `kind`: `script` (`duration_s`, max 15), `memory`. Returns top-N
@@ -146,12 +258,28 @@ hotspots/allocations as `name  ms|MB  %` lines, not raw dumps. `top` (default 25
 MicroProfiler capture has no plugin API and is not exposed.
 
 ## input
+`context` (`client` default — input goes to the play client, relayed by the
+play server; `edit`/`server` also accepted), `player?`, `restore?` (see visual
+pre-flight).
 `actions`: array of `{type: key|click|move|scroll|device|network|nav, ...}` —
-`key {code, hold_ms?}`, `click {x,y,button?}`, `move {x,y,duration_ms?}`,
+`key {code, hold_ms?}`, `click {path | x,y, button?}`, `move {x,y,duration_ms?}`,
 `device {name|reset}` (device emulation), `network {profile}` (throttle),
 `nav {to: path|[x,y,z], timeout_ms?}` (walk character via Humanoid/PathfindingService,
 covers built-in MCP character_navigation). Requires active playtest for
 key/click/nav. Returns per-action ack.
+
+`click {path}` resolves the target at click time: a GuiObject's
+`AbsolutePosition + AbsoluteSize/2 + GuiService:GetGuiInset()` (AbsolutePosition
+is measured below the top bar, input coordinates are not), or a part/model's
+`WorldToViewportPoint`. The cursor is moved there before pressing so hover
+handlers see it. Every click ack carries `x y hit=<path> layer=gui|world` — the
+topmost GuiObject at the point (`PlayerGui:GetGuiObjectsAtPosition`), else the
+part under the cursor — and for path clicks `reached=true|false`, plus
+`activated=true|false` when the target is a GuiButton. Input that cannot land
+is an `ERR … unsupported: <reason>` ack, never a silent ok: a ClickDetector
+target (synthetic clicks do not fire `MouseClick`/`MouseHoverEnter`), a hidden
+or disabled GUI, a SurfaceGui/BillboardGui button, a point outside the
+viewport, or a `VirtualInputManager` call Studio refused.
 
 ## asset
 `op`: `search {query, category?, limit}`, `details {ids}`, `thumbnail {id}`,

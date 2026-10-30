@@ -80,9 +80,16 @@ const PLUGIN_ROUTES: ReadonlySet<string> = new Set([
 const OPEN_ROUTES: ReadonlySet<string> = new Set(["GET /health", "GET /id", "GET /state"]);
 
 /** Ops whose args select a play-mode context; those go to the play-server session. */
-const RUNTIME_CONTEXT_OPS: ReadonlySet<OpName> = new Set<OpName>(["run.exec", "log.tail"]);
-/** Never wait behind the place queue: stopping must work while Studio is busy with something else. */
-const PRIORITY_OPS: ReadonlySet<OpName> = new Set<OpName>(["play.stop", "play.stopSignal", "play.status"]);
+const RUNTIME_CONTEXT_OPS: ReadonlySet<OpName> = new Set<OpName>([
+  "run.exec", "log.tail",
+  "run.job", "input.batch", "shot.capture",
+]);
+/**
+ * Never wait behind the place queue: stopping must work while Studio is busy
+ * with something else, and run.job collect is a wait (up to wait_ms) on an
+ * eval that already runs, which would otherwise hold the queue the whole time.
+ */
+const PRIORITY_OPS: ReadonlySet<OpName> = new Set<OpName>(["play.stop", "play.stopSignal", "play.status", "run.job"]);
 
 const PLUGIN_ERROR_CODES = ["NOPLUGIN", "TIMEOUT", "NOPATH", "BADARG", "STUDIO"] as const satisfies readonly BridgeErrorCode[];
 
@@ -575,7 +582,7 @@ export class Hub implements Bridge {
     const timeoutMs = clampTimeout(opts.timeoutMs);
     // Job ids must be unguessable: a result carrying a foreign id would
     // otherwise be a way to answer another client's call.
-    const job: Job = { id, op, args: withPlayer(routed.args, routed.player ?? opts.player) };
+    const job: Job = { id, op, args: withPlayer(routed.args, routed.player ?? opts.player), timeoutMs };
     return new Promise<unknown>((resolve, reject) => {
       const expire = () => this.failCall(id, new BridgeError("TIMEOUT", `${op} not answered in ${timeoutMs}ms`));
       const call: PendingCall = {

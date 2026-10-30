@@ -140,6 +140,21 @@ function encodeValue(value: any, depth: number, seen: {[any]: boolean}): any
 			origin = { r.Origin.X, r.Origin.Y, r.Origin.Z },
 			direction = { r.Direction.X, r.Direction.Y, r.Direction.Z },
 		}
+	elseif kind == "Content" then
+		local uri = (value :: any).Uri
+		return if type(uri) == "string" then uri else tostring(value)
+	elseif kind == "DateTime" then
+		return (value :: DateTime):ToIsoDate()
+	elseif kind == "TweenInfo" then
+		local t = value :: TweenInfo
+		return {
+			time = t.Time,
+			easingStyle = tostring(t.EasingStyle),
+			easingDirection = tostring(t.EasingDirection),
+			repeatCount = t.RepeatCount,
+			reverses = t.Reverses,
+			delayTime = t.DelayTime,
+		}
 	elseif kind == "Region3" then
 		local r = value :: Region3
 		return {

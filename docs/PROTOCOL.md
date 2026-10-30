@@ -186,7 +186,11 @@ requests: read-only, no secrets, and CORS keeps pages from reading them.
 Ops to one place run one at a time (Studio runs all of a place's DataModels on
 one main thread; fan-out only starves its renderer). Callers take turns
 round-robin, so a chatty session cannot starve another's single call.
-`play.stop`, `play.stopSignal` and `play.status` bypass the queue. The call
+`play.stop`, `play.stopSignal`, `play.status` and `run.job` (poll/collect/
+cancel of an eval that is already running; collect may wait `wait_ms`)
+bypass the queue. Each job carries `timeoutMs`, the daemon's deadline; the
+play server's client broker waits that long (minus 1 s) instead of a fixed
+10 s. The call
 timeout includes time spent waiting for a turn.
 
 ## Clients
@@ -211,7 +215,7 @@ only logged (`ogsync daemon stop` picks up a new build on the next call).
 `shot.capture`, `prof.micro`,
 `prof.script`, `prof.memory`, `input.batch`, `asset.op`, `rbxm.export`,
 `rbxm.import`, `hist.op`, `sel.get`, `sync.apply`, `sync.snapshot`,
-`sync.hash`, `sync.conflicts`.
+`sync.hash`, `sync.conflicts`, `run.job`, `script.stage`, `inst.transform`.
 
 Args/results per op mirror docs/TOOLS.md param/output contracts; the daemon
 does arg validation + output formatting, the plugin returns raw structured
@@ -250,6 +254,85 @@ with a warning.
 - **Test-mode plugins.** An edit peer reporting a running play test with no
   play-server peer after `plugin_grace_s` sets `playtest.warning`: "Load User
   Plugins in Test Mode" is probably off.
+
+## Runtime-context routing
+
+`run.exec`, `run.job`, `log.tail`, `input.batch` and `shot.capture` carry
+`context` (`ctx` accepted). `server`/`client` route to the play-server session
+(`NOPLUGIN` when no playtest runs); the play server's dispatcher relays
+`client` jobs over the broker to the player named by `player` (default: the
+first). Anything else goes to the bound edit session.
+
+## Eval jobs
+
+- `run.exec {code, context, player?, vm?: "game"|"plugin", async?, key?}`.
+  `vm` defaults to `game` for server/client and `plugin` for edit.
+  Synchronous result: `{id, gen, key?, vm, context, status: "done", elapsed,
+  output: [{level, text}], dropped, truncated, returns}`; a failed eval is an
+  error whose message ends in ` [vm=game|plugin]` plus the captured output.
+  `async: true` answers at once with `{job, gen, nonce, key?, vm, context,
+  async: true}`. `nonce` is 8 hex chars generated per plugin load (so per play
+  DataModel); the daemon puts it in the handle.
+- `run.job {action: "poll"|"collect"|"cancel"|"list", id?, nonce?, wait_ms?,
+  context, player?}` → the same snapshot shape (plus `nonce`); a `nonce` other
+  than the session's is refused, because ids restart at 1 per DataModel. `list`
+  answers `{jobs, nonce}`. Snapshot shape (`status`: `running`|`done`|`error`|
+  `cancelled`, `err` for the last two), or `{jobs: [{id, gen, key, vm, context,
+  status, elapsed}]}` for `list`. `collect` waits up to `wait_ms` and drops a
+  settled job; the daemon sets the call timeout above `wait_ms`.
+- Generations: ids are the per-session generation counter. A job started with
+  the `key` of an earlier job cancels it; `ogsync.delay` timers and a late
+  finish from a cancelled or superseded job are dropped. The bridge keeps the
+  cancel switch of the 64 most recent game-VM evals, so a superseding job can
+  still disarm timers armed by one that already returned.
+- Recorded writes (see Place writes) run one at a time in the plugin, so one
+  op's Cancel cannot roll back another op's write that landed while it yielded.
+- Game-VM transport (plugin ⇄ injected bridge, same DataModel): one
+  `BindableFunction` `Invoke` under the bridge script. Messages
+  `{kind: "exec", id, gen, module}` (blocks until settled), `{kind: "peek", id}`
+  and `{kind: "cancel", id}`; replies are one JSON string, because Bindable
+  marshalling drops mixed tables and nil holes.
+
+## Script text
+
+Ops that carry script text (`script.edit` `old`/`new`/`source`, `inst.set`
+targets' `source`) send field `F` as `F_b64` (base64 of the LF-normalized
+UTF-8 bytes) or `F_upload` (a staged upload id), plus `F_hash`
+(`contentHash` of the LF text). Plain `F` from older daemons is still accepted.
+The plugin refuses text whose hash differs, and after writing reads it back
+(`ScriptEditorService:GetEditorSource` when a document is open, `Source`
+otherwise) and refuses a write that did not stick. `script.edit` answers
+`{…, hash, verified: true, editor}`; `inst.set` adds
+`sources: [{path, hash, editor}]`.
+
+- `script.stage {upload, index, total, data}` → `{upload, received, total}`.
+  `data` is a slice of the base64 text (64 KiB, whole 4-char groups). Chunks may
+  arrive in any order; the consuming op fails when the upload is incomplete,
+  unknown or expired (staged chunks live 120 s; at most 16 uploads per session).
+
+## Place writes
+
+`inst.set`, `inst.create`, `inst.delete`, `inst.duplicate`, `inst.transform`,
+`script.edit` and `script.grep` with `replace` each run inside one
+`ChangeHistoryService:TryBeginRecording`/`FinishRecording` pair (Commit on
+success, Cancel when the op throws). `inst.delete` detaches with `Parent = nil`
+in edit mode so Undo can restore it.
+
+- `inst.transform {targets: [{path|paths, move?, rotate?, origin?, to?}],
+  dryRun?}` → `{dryRun?, moved?, planned: [{path, from, to, rotFrom, rotTo}],
+  truncated, total, skipped: [{path, ancestor}], errors}`. Positions are
+  `[x,y,z]`, rotations Orientation degrees, rounded to 0.001. Targets are
+  computed from original pivots, applied with `PivotTo`, then re-read; drift
+  over 0.001 studs is an error entry.
+
+## Capture and input
+
+- `shot.capture {target, context, player?, frame?, camera_focus?, hide_ui?, size,
+  capture_timeout_ms?}` → `{w, h, rgba, source: {w, h}, stride, viewport: {w, h},
+  inset: {x, y}, scale, warnings: [string]}`. `scale = w / viewport.w`.
+- `input.batch {actions, context, player?}`; click acks add `x, y, hit, layer,
+  reached?, activated?`. Unsupported input is an ack with `ok: false, err:
+  "… unsupported: <reason>"`.
 
 ## Play-mode specifics
 

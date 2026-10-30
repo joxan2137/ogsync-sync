@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { BridgeError, type Bridge, type PlaceState, type PlaytestInfo, type PlaytestPhase } from "@proto/types";
+import { checkVisual } from "../../window/visual.ts";
 import { capText, lines, row } from "../fmt.ts";
 import { callOpts, defineTool, LONG_TIMEOUT_MS, TIMEOUT_ARG } from "../tool.ts";
 
@@ -13,6 +14,8 @@ interface PlaytestResult {
   via?: string;
   note?: string;
   already?: boolean;
+  /** Set by the daemon on `already`: false when Studio was running a test this call did not start. */
+  yours?: boolean;
   stopped?: boolean;
 }
 
@@ -24,6 +27,7 @@ export const tool = defineTool({
     action: z.enum(["start", "stop", "status"]),
     mode: z.enum(["solo", "server"]).optional(),
     force: z.boolean().optional(),
+    restore: z.boolean().optional(),
     timeout_ms: TIMEOUT_ARG,
   },
   async handler(bridge, _deps, args) {
@@ -31,8 +35,17 @@ export const tool = defineTool({
     const opts = callOpts(args, LONG_TIMEOUT_MS);
 
     if (args.action === "start") {
+      // A Studio that cannot paint never brings a play test up: say why now.
+      const visual = await checkVisual(bridge.bound()?.placeName, { restore: args.restore });
+      if (!visual.ok) throw new BridgeError("STUDIO", `playtest start refused: ${visual.reason}`);
+      const notes = visual.warnings.map((warning) => `warn: ${warning}`);
       const data = (await bridge.call("play.start", { mode: args.mode ?? "solo" }, opts)) as PlaytestResult;
-      if (data.already) return describe("playtest already running (yours)", bridge.place?.() ?? null);
+      if (data.already) {
+        const head = data.yours === false
+          ? "playtest already running, started outside this call (no lease; stop needs force=true)"
+          : "playtest already running (yours)";
+        return capText(lines(describe(head, bridge.place?.() ?? null), notes));
+      }
       const place = await settle(bridge, ["running"], opts.timeoutMs);
       const confirmed = place?.playtest.state === "running";
       const head = confirmed ? `playtest started ${data.started ?? "?"}` : `playtest start requested (${data.started ?? "?"}), not confirmed yet`;
@@ -40,7 +53,7 @@ export const tool = defineTool({
         requested: data.requested === data.started ? undefined : data.requested,
         via: data.via,
       });
-      return capText(lines(detail, data.note, place ? stateLines(place.playtest) : undefined));
+      return capText(lines(detail, data.note, place ? stateLines(place.playtest) : undefined, notes));
     }
 
     try {

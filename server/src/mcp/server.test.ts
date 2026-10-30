@@ -41,11 +41,11 @@ function textOf(result: CallToolResult): string {
 }
 
 describe("tool surface", () => {
-  test("registers all 22 tools with json schemas and a target arg", async () => {
+  test("registers all 24 tools with json schemas and a target arg", async () => {
     const client = await connect(fakeBridge(() => ({})));
     const { tools } = await client.listTools();
     expect(tools.map((t) => t.name).sort()).toEqual([...TOOLS].map((t) => t.name).sort());
-    expect(tools).toHaveLength(22);
+    expect(tools).toHaveLength(24);
     for (const t of tools) {
       expect(t.description ?? "").not.toBe("");
       expect(t.inputSchema.type).toBe("object");

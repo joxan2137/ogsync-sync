@@ -7,6 +7,8 @@ local Src = script.Parent.Parent :: any
 local Path = require(Src.Util.Path)
 local Hash = require(Src.Util.Hash)
 local Output = require(Src.Util.Output)
+local Recording = require(Src.Util.Recording)
+local Source = require(Src.Util.Source)
 
 type Register = (string, (any) -> any) -> ()
 
@@ -21,13 +23,7 @@ local SCRIPTS_PER_YIELD = 500
 -- normalizeSource() in server/src/proto/types.ts: lines the daemon rejoins with
 -- \n have to hash to exactly what we reported, so normalize once on the way in
 -- and hash, split and return that same text.
-local function toLf(source: string): string
-	if string.find(source, "\r", 1, true) == nil then
-		return source
-	end
-	local lf = string.gsub(source, "\r\n", "\n")
-	return (string.gsub(lf, "\r", "\n"))
-end
+local toLf = Source.toLf
 
 local function splitLines(source: string): { string }
 	return string.split(source, "\n")
@@ -52,17 +48,6 @@ local function readSource(inst: Instance): string
 		error("cannot read source of " .. Path.of(inst) .. ": " .. tostring(source))
 	end
 	return toLf(source)
-end
-
-local function writeSource(inst: Instance, newSource: string)
-	local ok, err = pcall(function()
-		ScriptEditorService:UpdateSourceAsync(inst, function()
-			return newSource
-		end)
-	end)
-	if not ok then
-		error("cannot write source of " .. Path.of(inst) .. ": " .. tostring(err))
-	end
 end
 
 local function requireScript(path: any): Instance
@@ -366,16 +351,18 @@ return function(register: Register)
 		}
 	end)
 
-	register("script.edit", function(args: any): any
+	register("script.stage", Source.stage)
+
+	local function editScript(args: any): any
 		local inst: Instance? = nil
 		local created = false
 		if type(args.path) ~= "string" then
 			error("path must be a string")
 		end
 
-		local oldText = if type(args.old) == "string" then toLf(args.old) else nil
-		local newText = if type(args.new) == "string" then toLf(args.new) else nil
-		local sourceText = if type(args.source) == "string" then toLf(args.source) else nil
+		local oldText = Source.take(args, "old")
+		local newText = Source.take(args, "new")
+		local sourceText, sourceHash = Source.take(args, "source")
 
 		local resolved = Path.resolve(args.path)
 		if resolved then
@@ -484,20 +471,28 @@ return function(register: Register)
 			error("edit needs exactly one of old/new, lines, insert_after or source")
 		end
 
-		writeSource(target, newSource)
+		local written = Source.write(target, newSource, if newSource == sourceText then sourceHash else nil)
 		local newLines = splitLines(newSource)
 		return {
 			ok = true,
 			path = Path.of(target),
 			created = created,
 			total = #newLines,
-			hash = Hash.content(newSource),
+			hash = written.hash,
+			verified = true,
+			editor = written.editor,
 			replaced = replacedCount,
 			context = contextAround(newLines, center),
 		}
+	end
+
+	register("script.edit", function(args: any): any
+		return Recording.run("OGSync edit", function()
+			return editScript(args)
+		end)
 	end)
 
-	register("script.grep", function(args: any): any
+	local function grepScripts(args: any): any
 		if type(args.pattern) ~= "string" then
 			error("grep requires a pattern")
 		end
@@ -505,9 +500,14 @@ return function(register: Register)
 		if not root then
 			error(rootErr or "root not found")
 		end
-		local mode = args.mode or "content"
+		local mode: string = args.mode or "content"
+		if mode ~= "content" and mode ~= "files" and mode ~= "count" then
+			error("unknown grep mode '" .. tostring(mode) .. "' (content|files|count)")
+		end
 		local replacement = args.replace
-		if replacement ~= nil and mode ~= "content" then
+		-- Through a local so the checker does not narrow `mode` to "content" below.
+		local replaceAllowed = replacement == nil or mode == "content"
+		if not replaceAllowed then
 			error("replace requires mode=content")
 		end
 		local limit = math.max(tonumber(args.limit) or GREP_LIMIT_DEFAULT, 1)
@@ -567,7 +567,7 @@ return function(register: Register)
 				table.insert(files, path)
 				table.insert(counts, { path = path, count = fileMatches })
 				if replaced > 0 then
-					writeSource(inst, table.concat(lines, "\n"))
+					Source.write(inst, table.concat(lines, "\n"))
 					table.insert(changes, { path = path, count = replaced })
 				end
 			end
@@ -598,5 +598,14 @@ return function(register: Register)
 			result.truncated = truncated or capped
 		end
 		return result
+	end
+
+	register("script.grep", function(args: any): any
+		if args.replace == nil then
+			return grepScripts(args)
+		end
+		return Recording.run("OGSync replace", function()
+			return grepScripts(args)
+		end)
 	end)
 end
