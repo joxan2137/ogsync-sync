@@ -63,6 +63,8 @@ const REATTACH_GRACE_MS = 30_000;
 /** An unclean disappearance keeps the place listed (playtest "unknown") so hooks fail closed. */
 const PLACE_LINGER_MS = 120_000;
 const PLACE_CONCURRENCY = 1;
+/** How often an op waiting for a play session to attach looks again. */
+const PLAY_PEER_POLL_MS = 100;
 const MAX_BODY_BYTES = RESULT_CAP_BYTES * 2;
 const MAX_TARGET_BRIDGES = 64;
 const BEARER = "Bearer ";
@@ -416,7 +418,11 @@ export class Hub implements Bridge {
     const place = this.resolveRecord(spec, aliases);
     if (op === "play.start") return this.startPlaytest(place, spec.role, args, opts);
     if (op === "play.stop") return this.stopPlaytest(place, spec.role, args, opts);
-    return this.callPlace(place, spec.role, op, args, opts);
+    // A playtest that is starting or just started has no play-server peer for a
+    // second or two: wait for it instead of failing the first calls after start.
+    const waited = await this.awaitPlaySession(place, spec.role, op, args, opts.timeoutMs);
+    const timeoutMs = waited === 0 ? opts.timeoutMs : Math.max(MIN_CALL_TIMEOUT_MS, clampTimeout(opts.timeoutMs) - waited);
+    return this.callPlace(place, spec.role, op, args, { ...opts, timeoutMs });
   }
 
   resolvedPeer(spec: TargetSpec, aliases: Readonly<Record<string, string>>): SessionInfo | null {
@@ -575,6 +581,41 @@ export class Hub implements Bridge {
 
   // ------------------------------------------------------------- routing and admission
 
+  /** ms spent waiting (bounded by the op timeout and playtest.plugin_grace_s); 0 when nothing to wait for. */
+  private async awaitPlaySession(
+    place: PlaceRecord,
+    role: TargetRole | null,
+    op: OpName,
+    args: unknown,
+    timeoutMs: number | undefined,
+  ): Promise<number> {
+    if (!needsPlaySession(op, args, role) || this.hasPlaySession(place)) return 0;
+    const started = Date.now();
+    const deadline = started + Math.min(clampTimeout(timeoutMs), currentCaller().playtest.plugin_grace_s * 1000);
+    while (!this.hasPlaySession(place) && isPlaytestActive(place) && Date.now() < deadline) {
+      await Bun.sleep(PLAY_PEER_POLL_MS);
+    }
+    return Date.now() - started;
+  }
+
+  /** A play-server peer (or one re-attaching), or run mode, where the edit peer is the server. */
+  private hasPlaySession(place: PlaceRecord): boolean {
+    const server = slotOf(place.key, "server");
+    return this.peerAt(server) !== null || this.orphans.has(server) || place.tracker.runMode();
+  }
+
+  private noPlaySession(place: PlaceRecord, why: string): BridgeError {
+    const playtest = place.tracker.snapshot();
+    if (playtest.state !== "starting" && playtest.state !== "running") {
+      return new BridgeError("NOPLUGIN", `${why} needs a play-server session on ${place.key}; start a playtest first`);
+    }
+    const forS = Math.round((Date.now() - playtest.since) / 1000);
+    return new BridgeError(
+      "NOPLUGIN",
+      `${why}: the playtest on ${place.key} has been ${playtest.state} for ${forS}s but its play session never connected; "Load User Plugins in Test Mode" is probably off`,
+    );
+  }
+
   private callPlace(
     place: PlaceRecord,
     role: TargetRole | null,
@@ -627,7 +668,7 @@ export class Hub implements Bridge {
     const requireServer = (why: string): string => {
       if (this.peerAt(server) || this.orphans.has(server)) return server;
       if (place.tracker.runMode()) return edit;
-      throw new BridgeError("NOPLUGIN", `${why} needs a play-server session on ${place.key}; start a playtest first`);
+      throw this.noPlaySession(place, why);
     };
     const requireClients = (why: string): string => {
       if (this.peerAt(server) || this.orphans.has(server)) return server;
@@ -1330,6 +1371,17 @@ function withPlayer(args: unknown, player: CallOpts["player"]): unknown {
 function asClientContext(args: unknown): unknown {
   const base = isRecord(args) ? args : {};
   return { ...base, ctx: "client", ...(base["context"] === undefined ? {} : { context: "client" }) };
+}
+
+function needsPlaySession(op: OpName, args: unknown, role: TargetRole | null): boolean {
+  if (role === "server" || role?.startsWith("client")) return true;
+  if (role === "edit" || op === "play.stop" || op === "play.stopSignal") return false;
+  return runtimeContext(op, args) !== null;
+}
+
+function isPlaytestActive(place: PlaceRecord): boolean {
+  const state = place.tracker.snapshot().state;
+  return state === "starting" || state === "running";
 }
 
 function runtimeContext(op: OpName, args: unknown): "server" | "client" | null {

@@ -604,6 +604,41 @@ test("a start the plugin answers `already` leaves no lease and credits the user"
   expect(hub.place()?.playtest).toMatchObject({ state: "running", owner: null, startedBy: "user" });
 });
 
+describe("ops that arrive before the play session attaches", () => {
+  test("a client-context op during a running playtest waits for the play server", async () => {
+    await handshake();
+    await report("running", "s-edit", { mode: "play" });
+    const exec = hub.call("run.exec", { code: "return 1", context: "client" }, { timeoutMs: 5_000 });
+    await Bun.sleep(300);
+    await handshake({ session: "s-play", role: "server" });
+    const [job] = (await jobsFrom(await pull("s-play"))).jobs;
+    expect(job).toMatchObject({ op: "run.exec", args: { context: "client" } });
+    await push({ session: "s-play", results: [{ id: job!.id, ok: true, data: 7 }] });
+    expect(await exec).toBe(7);
+  });
+
+  test("past plugin_grace_s it fails saying the play session never connected", async () => {
+    await handshake();
+    await report("running", "s-edit", { mode: "play" });
+    const quick: Caller = { id: "a", playtest: { ...CONFIG_DEFAULTS.playtest, plugin_grace_s: 0.3 } };
+    const started = Date.now();
+    const err = expectBridgeError(await capture(runAs(quick, () => hub.call("run.exec", { code: "1", context: "server" }))));
+    expect(Date.now() - started).toBeGreaterThanOrEqual(250);
+    expect(err.code).toBe("NOPLUGIN");
+    expect(err.message).toContain("never connected");
+    expect(err.message).not.toContain("start a playtest first");
+  });
+
+  test("with no playtest it still fails at once", async () => {
+    await handshake();
+    await report("idle");
+    const started = Date.now();
+    const err = expectBridgeError(await capture(hub.call("run.exec", { code: "1", context: "server" })));
+    expect(Date.now() - started).toBeLessThan(200);
+    expect(err.message).toContain("start a playtest first");
+  });
+});
+
 describe("pairing play peers of unsaved places (placeId 0)", () => {
   const LOCAL = { placeId: 0, placeName: "OGSyncTest.rbxl" };
 

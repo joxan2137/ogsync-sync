@@ -276,6 +276,12 @@ with a warning.
 `client` jobs over the broker to the player named by `player` (default: the
 first). Anything else goes to the bound edit session.
 
+A server/client-context op on a place whose playtest is `starting` or
+`running` but whose play session has not attached yet waits for it (bounded
+by the op timeout and `plugin_grace_s`) instead of failing; if it never
+attaches the `NOPLUGIN` says the play session never connected. With no
+playtest it still fails at once ("start a playtest first").
+
 Run mode (`playtest start mode=server`, i.e. `RunService:Run()`, or F8)
 simulates the server inside the edit DataModel and no play-server peer ever
 registers. While the edit peer reports `running` with `mode: "run"`,

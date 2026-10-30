@@ -1,6 +1,7 @@
 import { z } from "zod";
 import { BridgeError, type Bridge, type PlaceState, type PlaytestInfo, type PlaytestPhase } from "@proto/types";
 import { checkVisual } from "../../window/visual.ts";
+import { currentCaller } from "../../hub/caller.ts";
 import { capText, lines, row } from "../fmt.ts";
 import { callOpts, defineTool, LONG_TIMEOUT_MS, TIMEOUT_ARG } from "../tool.ts";
 
@@ -48,8 +49,17 @@ export const tool = defineTool({
           : "playtest already running (yours)";
         return capText(lines(describe(head, bridge.place?.() ?? null), notes));
       }
-      const place = await settle(bridge, ["running"], opts.timeoutMs);
-      const confirmed = place?.playtest.state === "running";
+      // Started means usable: a play test (solo) needs its play server attached
+      // and a client reachable through it; run mode only needs to be running.
+      const graceMs = currentCaller().playtest.plugin_grace_s * 1000;
+      const needsPlaySession = data.started === "solo";
+      const place = await settleUntil(bridge, (state) => isUsable(state, needsPlaySession), Math.min(graceMs, opts.timeoutMs ?? graceMs));
+      const confirmed = place !== null && isUsable(place, needsPlaySession);
+      if (!confirmed && needsPlaySession && place?.playtest.state === "running") {
+        notes.push(
+          `warn: no play session connected within ${Math.round(graceMs / 1000)}s: "Load User Plugins in Test Mode" is probably off, so server and client tools cannot reach this playtest`,
+        );
+      }
       const head = confirmed ? `playtest started ${data.started ?? "?"}` : `playtest start requested (${data.started ?? "?"}), not confirmed yet`;
       const detail = row(head, {
         requested: data.requested === data.started ? undefined : data.requested,
@@ -76,6 +86,22 @@ export const tool = defineTool({
     return describe("playtest stop requested, not confirmed yet", place);
   },
 });
+
+function isUsable(place: PlaceState, needsPlaySession: boolean): boolean {
+  if (place.playtest.state !== "running") return false;
+  if (!needsPlaySession) return true;
+  return place.peers.some((peer) => peer.role === "server") && place.playtest.players > 0;
+}
+
+async function settleUntil(bridge: Bridge, ready: (place: PlaceState) => boolean, timeoutMs: number): Promise<PlaceState | null> {
+  const deadline = Date.now() + timeoutMs;
+  let place = bridge.place?.() ?? null;
+  while (place !== null && !ready(place) && Date.now() < deadline) {
+    await Bun.sleep(SETTLE_POLL_MS);
+    place = bridge.place?.() ?? null;
+  }
+  return place;
+}
 
 async function settle(bridge: Bridge, wanted: PlaytestPhase[], timeoutMs = SETTLE_MS): Promise<PlaceState | null> {
   const deadline = Date.now() + Math.min(SETTLE_MS, timeoutMs);

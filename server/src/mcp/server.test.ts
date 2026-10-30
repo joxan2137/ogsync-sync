@@ -11,7 +11,9 @@ import {
   type PlaytestInfo,
   type SessionInfo,
 } from "@proto/types";
-import { createMcpServer } from "./server.ts";
+import { CONFIG_DEFAULTS } from "@proto/types";
+import { runAs } from "../hub/caller.ts";
+import { createMcpServer, executeTool } from "./server.ts";
 import { TOOLS } from "./tools/index.ts";
 
 function fakeBridge(reply: (op: OpName, args: unknown) => unknown): Bridge {
@@ -241,19 +243,48 @@ describe("playtest lifecycle and wait", () => {
     expect(text).toContain("WARNING: Load User Plugins");
   });
 
-  test("start answers only once the plugin confirms the playtest is running", async () => {
+  test("a solo start answers only once the play server attached and a client is reachable", async () => {
     let state: PlaytestInfo["state"] = "starting";
+    let peers: PlaceState["peers"] = [];
+    let players = 0;
     const bridge: Bridge = {
       ...fakeBridge((op) => {
         expect(op).toBe("play.start");
-        setTimeout(() => (state = "running"), 300);
+        setTimeout(() => (state = "running"), 200);
+        setTimeout(() => (peers = [{ role: "server", pluginVersion: "0", ageMs: 0 }]), 600);
+        setTimeout(() => (players = 1), 900);
         return { started: "solo", requested: "solo" };
       }),
-      place: () => placeWith({ state, mode: "play" }),
+      place: () => ({ ...placeWith({ state, mode: "play", players }), peers }),
     };
+    const started = Date.now();
     const text = textOf((await (await connect(bridge)).callTool({ name: "playtest", arguments: { action: "start" } })) as CallToolResult);
+    expect(Date.now() - started).toBeGreaterThanOrEqual(850);
     expect(text).toStartWith("playtest started solo");
-    expect(text).toContain("state=running");
+    expect(text).toContain("players=1");
+  });
+
+  test("a solo start whose play session never attaches returns after plugin_grace_s with the warning", async () => {
+    const bridge: Bridge = {
+      ...fakeBridge(() => ({ started: "solo", requested: "solo" })),
+      place: () => placeWith({ state: "running", mode: "play" }),
+    };
+    const quick = { id: "a", playtest: { ...CONFIG_DEFAULTS.playtest, plugin_grace_s: 0.5 } };
+    const result = await runAs(quick, () =>
+      executeTool(bridge, { sync: null, version: "0.1.0" }, "playtest", { action: "start" }),
+    );
+    const text = textOf(result);
+    expect(text).toStartWith("playtest start requested (solo), not confirmed yet");
+    expect(text).toContain("Load User Plugins in Test Mode");
+  });
+
+  test("a run-mode start (mode=server) only needs the playtest running", async () => {
+    const bridge: Bridge = {
+      ...fakeBridge(() => ({ started: "server", requested: "server" })),
+      place: () => placeWith({ state: "running", mode: "run" }),
+    };
+    const text = textOf((await (await connect(bridge)).callTool({ name: "playtest", arguments: { action: "start", mode: "server" } })) as CallToolResult);
+    expect(text).toStartWith("playtest started server");
   });
 
   test("wait for=log returns the first new matching line", async () => {

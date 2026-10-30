@@ -200,8 +200,11 @@ peers are registered; `status` costs no Studio round trip. Output:
 that differ from the edit DataModel, and `WARNING: …` (e.g. "Load User
 Plugins in Test Mode" is probably off, a start that never came up, an
 auto-end).
-- `start` records the calling session as lease owner and waits up to 15 s for
-  the plugin to confirm `running`; it says "not confirmed yet" otherwise.
+- `start` records the calling session as lease owner and answers once the
+  playtest is usable: for `solo`, the play server has attached and a client
+  is reachable through it; for run mode (`server`), it is running. Bounded by
+  `plugin_grace_s`; past it the answer says "not confirmed yet" with the "Load
+  User Plugins in Test Mode" warning.
   Starting again as the owner answers `already running (yours)`; anyone else
   gets `ERR LEASE`. `solo` uses StudioTestService when available, degrades to
   `server` (run mode) when Studio refuses play-solo, and the result says which.
