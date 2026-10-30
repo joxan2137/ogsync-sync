@@ -32,6 +32,7 @@ local SERVICE_CLASS: { [string]: string } = {
 	ServerStorage = "Folder",
 	StarterPlayer = "Folder",
 	Workspace = "Folder",
+	ChangeHistoryService = "Instance",
 }
 
 local function findSourceDir(): string
@@ -297,6 +298,9 @@ function Harness.new()
 			return env.load(path)
 		end,
 	}
+
+	-- Tests add engine datatypes (CFrame, Vector3, ...) here before loading.
+	env.globals = globals
 
 	env.load = function(path: string)
 		local cached = env._modules[path]
