@@ -9,7 +9,7 @@
     "dev": "bun run server/src/index.ts serve",
     "typecheck": "tsc --noEmit",
     "test": "bun test",
-    "test:plugin": "lune run plugin/tests/sync_guards.test",
+    "test:plugin": "lune run plugin/tests/sync_guards.test && lune run plugin/tests/core.test",
     "build:plugin": "rojo build plugin -o dist/OGSync.rbxm",
     "build:embed": "bun run scripts/embed-plugin.ts",
     "build:bin": "bun run scripts/build-binaries.ts",

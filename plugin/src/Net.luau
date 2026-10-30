@@ -2,14 +2,21 @@
 -- Daemon transport (docs/PROTOCOL.md): handshake, long-poll pull, batched push.
 -- The plugin is always the HTTP client and never runs in a play-mode client
 -- DataModel (HttpService is unavailable there).
+--
+-- Never pinned to a port: when the daemon stops answering, the next handshake
+-- scans Util/Ports with a cheap GET /id and follows it wherever it moved. Any
+-- unknown-session answer (daemon restarted) re-handshakes with the same
+-- session id, and the job log keeps redelivered jobs from running twice.
 
 local HttpService = game:GetService("HttpService")
 
 local Dispatcher = require(script.Parent.Dispatcher)
+local JobLog = require(script.Parent.Util.JobLog)
 local Output = require(script.Parent.Util.Output)
+local Ports = require(script.Parent.Util.Ports)
 local Version = require(script.Parent.Version)
 
-local PROTO = 1
+local PROTO = 2
 local HANDSHAKE_RETRY = 5
 local BACKOFF_MIN = 1
 local BACKOFF_MAX = 10
@@ -22,7 +29,7 @@ local MAX_QUEUED_EVENTS = 500
 local MAX_QUEUED_RESULTS = 200
 local BODY_BUDGET = Output.MAX_BYTES - 4096
 
-export type Config = { baseUrl: string, session: string, role: string }
+export type Config = { port: number, session: string, role: string }
 
 export type Status = {
 	connected: boolean,
@@ -42,6 +49,7 @@ local generation = 0
 local cursor = 0
 local backoff = BACKOFF_MIN
 local baseUrl = ""
+local preferredPort: number? = nil
 local session = ""
 local role = ""
 
@@ -49,6 +57,7 @@ local eventQueue: {any} = {}
 local resultQueue: {any} = {}
 local flushThread: thread? = nil
 local flushDeadline: number? = nil
+local jobLog = JobLog.new()
 
 local state: Status = {
 	connected = false,
@@ -61,9 +70,15 @@ local state: Status = {
 
 -- UI.setState, injected by init so the transport never requires the UI layer.
 local observer: ((partial: {[string]: any}) -> ())? = nil
+-- Lifecycle.connected, injected by init: report state right after each handshake.
+local connectedHook: (() -> ())? = nil
 
 function Net.setObserver(fn: ((partial: {[string]: any}) -> ())?)
 	observer = fn
+end
+
+function Net.setConnectedHook(fn: (() -> ())?)
+	connectedHook = fn
 end
 
 local function notify(partial: {[string]: any})
@@ -117,6 +132,31 @@ local function request(method: string, url: string, body: any?): (number, any, s
 		end
 	end
 	return (response :: any).StatusCode, decoded, nil
+end
+
+local function urlFor(port: number): string
+	return string.format("http://127.0.0.1:%d", port)
+end
+
+-- Finds a live daemon by its identity answer, last good port first. True when
+-- it answers somewhere other than where the last attempt went.
+local function discover(): boolean
+	local before = baseUrl
+	for _, port in Ports.order(preferredPort) do
+		if not running then
+			return false
+		end
+		local status, body = request("GET", urlFor(port) .. "/id")
+		if status == 200 and type(body) == "table" and (body :: any).service == "ogsync" then
+			preferredPort = port
+			baseUrl = urlFor(port)
+			if baseUrl ~= before then
+				notify({ port = port })
+			end
+			return baseUrl ~= before
+		end
+	end
+	return false
 end
 
 -- ------------------------------------------------------------------ push side
@@ -201,6 +241,11 @@ function flushNow()
 	if err ~= nil or status == 0 or status >= 400 then
 		state.connected = false
 		state.reason = err or string.format("push %d", status)
+		if status == 404 or status == 409 then
+			-- The daemon no longer knows this session: re-handshake, then retry.
+			accepted = false
+			state.accepted = false
+		end
 		-- Results are worth a retry; events are fire-and-forget per protocol.
 		for index = #results, 1, -1 do
 			if #resultQueue < MAX_QUEUED_RESULTS then
@@ -257,7 +302,12 @@ local function runJob(job: any)
 	if type(job) ~= "table" or type(job.id) ~= "string" then
 		return
 	end
-	queueResult(Dispatcher.dispatch(job))
+	if JobLog.begin(jobLog, job.id) ~= "new" then
+		return
+	end
+	local result = Dispatcher.dispatch(job)
+	JobLog.finish(jobLog, job.id)
+	queueResult(result)
 end
 
 local function doHandshake(): boolean
@@ -273,6 +323,9 @@ local function doHandshake(): boolean
 	if err ~= nil or status == 0 then
 		state.connected = false
 		state.reason = err
+		if discover() then
+			return true
+		end
 		local retry = nextBackoff()
 		notify({ status = "connecting", reason = state.reason, retryIn = retry })
 		task.wait(retry)
@@ -288,17 +341,20 @@ local function doHandshake(): boolean
 
 	local response = body :: any
 	if response.proto ~= PROTO then
-		warn(string.format(
-			"[OGSync] protocol mismatch: plugin speaks proto %d, daemon speaks %s — update the plugin",
-			PROTO,
-			tostring(response.proto)
-		))
+		local reason = if type(response.reason) == "string"
+			then response.reason
+			else string.format(
+				"plugin speaks proto %d, daemon speaks proto %s: run `ogsync plugin install` and reload plugins in Studio",
+				PROTO,
+				tostring(response.proto)
+			)
+		warn("[OGSync] protocol mismatch: " .. reason)
 		state.reason = "protocol mismatch"
 		state.connected = false
 		running = false
 		notify({
 			status = "update",
-			reason = string.format("daemon speaks proto %s, plugin speaks %d", tostring(response.proto), PROTO),
+			reason = reason,
 			serverVersion = response.serverVersion,
 			updatePlugin = true,
 			connected = false,
@@ -335,6 +391,10 @@ local function doHandshake(): boolean
 	if response.updatePlugin == true then
 		warn("[OGSync] daemon has a newer plugin build — reload plugins in Studio")
 	end
+	local hook = connectedHook
+	if hook ~= nil then
+		task.spawn(hook)
+	end
 	-- "" rather than nil: absent keys are skipped by the merge, so clearing a
 	-- stale reason needs a present-but-empty value.
 	notify({
@@ -356,8 +416,11 @@ local function pullOnce()
 	)
 
 	if err ~= nil or status == 0 then
+		-- The daemon may have died or moved; the handshake path rediscovers it.
 		state.connected = false
 		state.reason = err
+		accepted = false
+		state.accepted = false
 		local retry = nextBackoff()
 		notify({ status = "connecting", reason = state.reason, retryIn = retry })
 		task.wait(retry)
@@ -421,7 +484,8 @@ function Net.start(config: Config)
 	running = true
 	accepted = false
 	cursor = 0
-	baseUrl = config.baseUrl
+	preferredPort = config.port
+	baseUrl = urlFor(config.port)
 	session = config.session
 	role = config.role
 	resetBackoff()
@@ -447,7 +511,19 @@ function Net.start(config: Config)
 	end)
 end
 
+local function sayGoodbye()
+	local url = baseUrl
+	local leaving = session
+	task.spawn(function()
+		request("POST", url .. "/push", { session = leaving, events = { { ev = "goodbye" } } })
+	end)
+end
+
 function Net.stop()
+	if running and accepted then
+		-- Lets the daemon drop this peer now instead of after its session TTL.
+		sayGoodbye()
+	end
 	running = false
 	accepted = false
 	generation += 1

@@ -11,6 +11,7 @@ local Path = require(script.Parent.Util.Path)
 local OPS_MODULES = {
 	"Inst", "Script", "Run", "Play", "Log", "Shot",
 	"Prof", "Input", "Asset", "Rbxm", "Hist", "Sel",
+	"Wait",
 }
 
 export type Job = { id: string, op: string, args: any }

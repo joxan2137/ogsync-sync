@@ -9,6 +9,7 @@ local RunService = game:GetService("RunService")
 local Applier = require(script.Sync.Applier)
 local Broker = require(script.Broker)
 local Dispatcher = require(script.Dispatcher)
+local Lifecycle = require(script.Lifecycle)
 local Net = require(script.Net)
 local Panel = require(script.UI.Panel)
 local Version = require(script.Version)
@@ -45,7 +46,7 @@ local role = detectRole()
 local session = HttpService:GenerateGUID(false)
 local port = readPort()
 local config = {
-	baseUrl = string.format("http://127.0.0.1:%d", port),
+	port = port,
 	session = session,
 	role = role,
 }
@@ -53,6 +54,12 @@ local config = {
 Dispatcher.setup({ plugin = plugin, role = role, session = session })
 
 local cleanups: {() -> ()} = {}
+
+-- Edit and play-server sessions report playtest state; clients have no HTTP.
+local function startLifecycle()
+	Net.setConnectedHook(Lifecycle.connected)
+	table.insert(cleanups, Lifecycle.start({ role = role, pushEvent = Net.pushEvent }))
+end
 
 local function startSync()
 	Applier.onRootsChanged = Watcher.setRoots
@@ -96,6 +103,7 @@ if role == "client" then
 elseif role == "server" then
 	Broker.startHost()
 	Dispatcher.setClientRouter(Broker.toClient)
+	startLifecycle()
 	Net.start(config)
 	table.insert(cleanups, startStopMonitor())
 	table.insert(cleanups, Net.stop)
@@ -124,7 +132,7 @@ else
 
 	local function setPort(newPort: number)
 		plugin:SetSetting(SETTING_PORT, newPort)
-		config.baseUrl = string.format("http://127.0.0.1:%d", newPort)
+		config.port = newPort
 		Panel.setState({ port = newPort })
 		if Net.isRunning() then
 			stopSync()
@@ -148,6 +156,7 @@ else
 	Applier.onSyncState = Panel.setState
 	button.Click:Connect(Panel.toggle)
 
+	startLifecycle()
 	if enabled then
 		startSync()
 	end
