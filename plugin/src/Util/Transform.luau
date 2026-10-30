@@ -95,10 +95,12 @@ function Transform.target(from: CFrame, spec: Spec, center: Vector3): CFrame
 	return result
 end
 
-local function ancestorIn(inst: Instance, listed: { [Instance]: boolean }): Instance?
+-- Only Model:PivotTo carries descendants; BasePart:PivotTo moves just that part
+-- (and whatever is welded to it), so a part under a listed part still moves itself.
+local function modelAncestorIn(inst: Instance, listed: { [Instance]: boolean }): Instance?
 	local current = inst.Parent
 	while current ~= nil do
-		if listed[current] then
+		if listed[current] and current:IsA("Model") then
 			return current
 		end
 		current = current.Parent
@@ -106,8 +108,8 @@ local function ancestorIn(inst: Instance, listed: { [Instance]: boolean }): Inst
 	return nil
 end
 
--- A listed instance whose ancestor is also listed rides along with that
--- ancestor; giving it a pivot of its own would fight the ancestor's rotation.
+-- A listed instance under a listed Model rides along with that Model; giving it
+-- a pivot of its own would fight the Model's rotation.
 function Transform.plan(groups: { Group }): ({ Step }, { Skip })
 	local listed: { [Instance]: boolean } = {}
 	for _, group in groups do
@@ -126,7 +128,7 @@ function Transform.plan(groups: { Group }): ({ Step }, { Skip })
 				continue
 			end
 			planned[member.inst] = true
-			local ancestor = ancestorIn(member.inst, listed)
+			local ancestor = modelAncestorIn(member.inst, listed)
 			if ancestor ~= nil then
 				table.insert(skipped, { inst = member.inst, ancestor = ancestor })
 				continue

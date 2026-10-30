@@ -17,6 +17,7 @@ const DESKTOP_READOBJECTS = 0x0001;
 const UOI_NAME = 2;
 const DWMWA_EXTENDED_FRAME_BOUNDS = 9;
 const DWMWA_CLOAKED = 14;
+const DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = -4;
 const TITLE_CHARS = 512;
 const PATH_CHARS = 1024;
 
@@ -38,6 +39,9 @@ function load() {
     OpenInputDesktop: { args: [u32, i32, u32], returns: P },
     GetUserObjectInformationW: { args: [P, i32, P, u32, P], returns: i32 },
     CloseDesktop: { args: [P], returns: i32 },
+    // DPI_AWARENESS_CONTEXT is a pseudo-handle (small negative values), so it
+    // travels as a signed integer rather than a pointer.
+    SetThreadDpiAwarenessContext: { args: [i64], returns: i64 },
   });
   const kernel32 = dlopen("kernel32.dll", {
     OpenProcess: { args: [u32, i32, u32], returns: P },
@@ -109,7 +113,19 @@ function isLocked({ user32 }: Libs): boolean {
   }
 }
 
+// DWM frame bounds are always physical pixels, while GetWindowRect and
+// GetMonitorInfo answer in the calling thread's DPI space. Per-monitor-v2
+// awareness for the walk puts every rect in physical pixels.
 function snapshot(l: Libs): DesktopSnapshot {
+  const previous = l.user32.SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+  try {
+    return walk(l);
+  } finally {
+    if (previous) l.user32.SetThreadDpiAwarenessContext(previous);
+  }
+}
+
+function walk(l: Libs): DesktopSnapshot {
   const { user32, dwm } = l;
   const windows: WinWindow[] = [];
   const names = new Map<number, string>();

@@ -187,6 +187,8 @@ local function sendClick(vim: any, action: any): any
 	local button = BUTTONS[tostring(action.button)] or tonumber(action.button) or 0
 	-- Hover first: buttons that react to MouseEnter never see a teleporting cursor.
 	send(vim, "SendMouseMoveEvent", x, y, game)
+	-- Hit-test what the press lands on, before the click can hide or move it.
+	local hit, layer = hitAt(x, y)
 	send(vim, "SendMouseButtonEvent", x, y, button, true, game, 0)
 	task.wait(0.03)
 	send(vim, "SendMouseButtonEvent", x, y, button, false, game, 0)
@@ -196,7 +198,6 @@ local function sendClick(vim: any, action: any): any
 		connection:Disconnect()
 	end
 
-	local hit, layer = hitAt(x, y)
 	local ack: any = { x = math.floor(x + 0.5), y = math.floor(y + 0.5), hit = if hit then Path.of(hit) else nil, layer = layer }
 	if target ~= nil then
 		ack.reached = hit ~= nil and (hit == target or hit:IsDescendantOf(target))

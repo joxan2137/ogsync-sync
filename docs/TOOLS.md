@@ -61,8 +61,12 @@ Async eval jobs from `run async=true`. `action`: `poll` (default — status and
 output so far, job kept), `collect` (waits up to `wait_ms`, default 10000, then
 returns the result and forgets a finished job; a still-running job answers
 `still running; collect again`), `cancel`, `list` (jobs in `context`).
-`handle` is what `run` printed: `edit:3`, `server:7`, `client:2` or
-`client@Player1:2` — it names the session that owns the job. Client collects
+`handle` is what `run` printed: `edit:3.<nonce>`, `server:7.<nonce>` or
+`client@Player1:2.<nonce>` — it names the session that owns the job, and the
+nonce identifies that session's job registry: ids restart at 1 in every play
+DataModel, so a handle from an earlier playtest is refused with
+`job N is from an earlier playtest or plugin load` instead of reaching a
+different job. Client collects
 wait at most 8000 ms per call (broker relay cap). Finished, uncollected jobs are
 kept per session, newest 32. Output:
 `job <handle> <status><TAB>vm=… gen=… elapsed_s=…` then output, `=> returns`, and
@@ -155,8 +159,10 @@ pivots. `dry_run=true` returns the plan without writing.
 Every target pivot is computed from the **original** pivots before anything
 moves, then applied with `PivotTo` (never by writing `WorldPivot`). Moving one
 member of a welded assembly drags its partners; precomputed absolute targets
-mean nothing compounds. An instance whose ancestor is also listed is skipped
-(`skip <path> (moves with <ancestor>)`). After applying, any instance more than
+mean nothing compounds. An instance under a listed **Model** is skipped
+(`skip <path> (moves with <ancestor>)`), since Model:PivotTo carries its
+descendants; a part under a listed BasePart still gets its own step, because
+BasePart:PivotTo moves only that part and what is welded to it. After applying, any instance more than
 0.001 studs off its target (dragged by a weld to something moved later) is
 reported as an `ERR` line.
 Output: `ok N moved` or `dry-run N planned`, then

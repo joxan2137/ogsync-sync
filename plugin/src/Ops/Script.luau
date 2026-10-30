@@ -500,9 +500,14 @@ return function(register: Register)
 		if not root then
 			error(rootErr or "root not found")
 		end
-		local mode = args.mode or "content"
+		local mode: string = args.mode or "content"
+		if mode ~= "content" and mode ~= "files" and mode ~= "count" then
+			error("unknown grep mode '" .. tostring(mode) .. "' (content|files|count)")
+		end
 		local replacement = args.replace
-		if replacement ~= nil and mode ~= "content" then
+		-- Through a local so the checker does not narrow `mode` to "content" below.
+		local replaceAllowed = replacement == nil or mode == "content"
+		if not replaceAllowed then
 			error("replace requires mode=content")
 		end
 		local limit = math.max(tonumber(args.limit) or GREP_LIMIT_DEFAULT, 1)

@@ -21,6 +21,7 @@ local ANCESTRY: { [string]: { string } } = {
 	LocalScript = { "LocalScript", "BaseScript", "LuaSourceContainer", "Instance" },
 	ModuleScript = { "ModuleScript", "LuaSourceContainer", "Instance" },
 	Part = { "Part", "BasePart", "Instance" },
+	Model = { "Model", "PVInstance", "Instance" },
 }
 
 local SERVICE_CLASS: { [string]: string } = {
@@ -280,10 +281,18 @@ function Harness.new()
 				return 0
 			end,
 			spawn = function(fn, ...)
-				fn(...)
+				if type(fn) == "thread" then
+					coroutine.resume(fn, ...)
+				else
+					fn(...)
+				end
 			end,
 			defer = function(fn, ...)
-				fn(...)
+				if type(fn) == "thread" then
+					coroutine.resume(fn, ...)
+				else
+					fn(...)
+				end
 			end,
 			delay = function(_seconds, fn)
 				return fn

@@ -141,7 +141,7 @@ end
 local function testJobs()
 	local env = newEnv()
 	local Jobs = env.load("Ops/Run/Jobs")
-	local registry = Jobs.new()
+	local registry = Jobs.new("n1")
 
 	local first = registry:start({ key = "sampler", vm = "plugin", context = "edit" })
 	local fired = 0
@@ -184,9 +184,10 @@ local function testJobs()
 
 	local snapshot = registry:snapshot(second)
 	check("snapshot carries vm, gen and status", snapshot.vm == "plugin" and snapshot.gen == second.gen and snapshot.status == "done")
+	check("snapshot carries the registry nonce", snapshot.nonce == "n1")
 	check("take forgets a job", registry:take(second.id) == second and registry:get(second.id) == nil)
 
-	local burst = Jobs.new()
+	local burst = Jobs.new("n2")
 	for _ = 1, 40 do
 		burst:finish(burst:start({ vm = "plugin", context = "edit" }), true, {})
 	end
@@ -227,6 +228,28 @@ local function testRecording()
 		ran = true
 	end)
 	check("no recording available still writes", ran and #finished == 2)
+
+	-- A write that yields holds the lock; a second write waits for it, so a
+	-- Cancel of the first can never roll back the second.
+	nextId = "rec2"
+	local order = {}
+	local first = coroutine.create(function()
+		Recording.run("first", function()
+			table.insert(order, "first:start")
+			coroutine.yield()
+			table.insert(order, "first:end")
+		end)
+	end)
+	local second = coroutine.create(function()
+		Recording.run("second", function()
+			table.insert(order, "second")
+		end)
+	end)
+	coroutine.resume(first)
+	coroutine.resume(second)
+	check("second write waits while the first yields", table.concat(order, ",") == "first:start", table.concat(order, ","))
+	coroutine.resume(first)
+	check("second write runs after the first finishes", table.concat(order, ",") == "first:start,first:end,second", table.concat(order, ","))
 end
 
 -- ------------------------------------------------------------------ transform
@@ -261,10 +284,17 @@ local function testTransform()
 	local steps, skipped = Transform.plan({
 		{ spec = moveSpec, members = { { inst = a, from = fromA }, { inst = b, from = fromB }, { inst = child, from = fromA } } },
 	})
-	check("each target computed from its own original pivot", #steps == 2
+	check("each target computed from its own original pivot", #steps == 3
 		and near(steps[1].to.Position, Vector3.new(0, 5, 0))
 		and near(steps[2].to.Position, Vector3.new(10, 5, 0)))
-	check("a listed descendant rides with its ancestor", #skipped == 1 and skipped[1].inst == child and skipped[1].ancestor == a)
+	check("a part under a listed part moves itself (BasePart:PivotTo leaves children)", #skipped == 0 and steps[3].inst == child)
+
+	local hut = env.newInstance("Model", "Hut", workspace)
+	local door = env.newInstance("Part", "Door", hut)
+	local _, riders = Transform.plan({
+		{ spec = moveSpec, members = { { inst = hut, from = fromA }, { inst = door, from = fromB } } },
+	})
+	check("a listed descendant of a listed Model rides with it", #riders == 1 and riders[1].inst == door and riders[1].ancestor == hut)
 
 	local spin = Transform.decodeSpec({ rotate = { 0, 90, 0 } })
 	local onPivot = Transform.plan({ { spec = spin, members = { { inst = b, from = fromB } } } })

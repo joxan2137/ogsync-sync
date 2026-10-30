@@ -161,7 +161,8 @@ local function hideUi(): () -> ()
 		end
 	end
 	-- Edit viewport: Studio's own UI-visibility toggle, so no ScreenGui is
-	-- touched and nothing lands in the place even if restore never ran.
+	-- touched. It is still a saved StarterGui property that can replicate in
+	-- Team Create, so the restore below is load-bearing.
 	local previous = StarterGui.ShowDevelopmentGui
 	local ok, err = pcall(function()
 		StarterGui.ShowDevelopmentGui = false
@@ -341,9 +342,7 @@ local function parseSize(size: any): (number?, number?)
 	return tonumber(w), tonumber(h)
 end
 
-local function capture(args: any, timeout: number): any
-	local contentId = captureContentId(timeout)
-	local image = editableImage(contentId)
+local function readImage(args: any, image: any): any
 	local sizeOk, imageSize = pcall(function()
 		return image.Size
 	end)
@@ -386,10 +385,6 @@ local function capture(args: any, timeout: number): any
 		end
 	end
 
-	pcall(function()
-		image:Destroy()
-	end)
-
 	return {
 		w = outWidth,
 		h = outHeight,
@@ -397,6 +392,19 @@ local function capture(args: any, timeout: number): any
 		source = { w = width, h = height },
 		stride = stride,
 	}
+end
+
+-- EditableImages hold engine memory until destroyed, so every path frees it.
+local function capture(args: any, timeout: number): any
+	local image = editableImage(captureContentId(timeout))
+	local ok, result = pcall(readImage, args, image)
+	pcall(function()
+		image:Destroy()
+	end)
+	if not ok then
+		error(result, 0)
+	end
+	return result
 end
 
 return function(register: Register)
