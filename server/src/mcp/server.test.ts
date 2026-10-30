@@ -2,7 +2,15 @@ import { describe, expect, test } from "bun:test";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
-import { BridgeError, type Bridge, type OpName } from "@proto/types";
+import {
+  BridgeError,
+  type Bridge,
+  type BridgeEvent,
+  type OpName,
+  type PlaceState,
+  type PlaytestInfo,
+  type SessionInfo,
+} from "@proto/types";
 import { createMcpServer } from "./server.ts";
 import { TOOLS } from "./tools/index.ts";
 
@@ -33,14 +41,15 @@ function textOf(result: CallToolResult): string {
 }
 
 describe("tool surface", () => {
-  test("registers all 21 tools with json schemas", async () => {
+  test("registers all 22 tools with json schemas and a target arg", async () => {
     const client = await connect(fakeBridge(() => ({})));
     const { tools } = await client.listTools();
     expect(tools.map((t) => t.name).sort()).toEqual([...TOOLS].map((t) => t.name).sort());
-    expect(tools).toHaveLength(21);
+    expect(tools).toHaveLength(22);
     for (const t of tools) {
       expect(t.description ?? "").not.toBe("");
       expect(t.inputSchema.type).toBe("object");
+      expect(Object.keys(t.inputSchema.properties ?? {})).toContain("target");
     }
   });
 
@@ -185,5 +194,115 @@ describe("tool dispatch", () => {
     const result = (await client.callTool({ name: "playtest", arguments: { action: "stop" } })) as CallToolResult;
     expect(textOf(result)).toContain("stopped");
     expect(seen).toEqual(["play.stop", "play.stopSignal"]);
+  });
+});
+
+function placeWith(playtest: Partial<PlaytestInfo>): PlaceState {
+  return {
+    key: "42",
+    name: "Place2",
+    placeId: 42,
+    peers: [],
+    playtest: {
+      state: "idle",
+      mode: null,
+      owner: null,
+      startedBy: null,
+      since: Date.now(),
+      heartbeatAgeMs: 100,
+      players: 0,
+      stale: null,
+      warning: null,
+      ...playtest,
+    },
+  };
+}
+
+describe("playtest lifecycle and wait", () => {
+  test("status reads daemon state, flags stale code and the plugins-in-test-mode warning", async () => {
+    const bridge: Bridge = {
+      ...fakeBridge(() => {
+        throw new Error("status must not touch Studio");
+      }),
+      place: () =>
+        placeWith({
+          state: "running",
+          mode: "play",
+          owner: "serve-1",
+          startedBy: "agent",
+          stale: { changed: 2, missing: 1, sample: ["game.ServerScriptService.Main"] },
+          warning: "Load User Plugins in Test Mode is probably off",
+        }),
+    };
+    const text = textOf((await (await connect(bridge)).callTool({ name: "playtest", arguments: { action: "status" } })) as CallToolResult);
+    expect(text).toContain("state=running");
+    expect(text).toContain("owner=serve-1");
+    expect(text).toContain("STALE CODE: 2 changed, 1 missing");
+    expect(text).toContain("WARNING: Load User Plugins");
+  });
+
+  test("start answers only once the plugin confirms the playtest is running", async () => {
+    let state: PlaytestInfo["state"] = "starting";
+    const bridge: Bridge = {
+      ...fakeBridge((op) => {
+        expect(op).toBe("play.start");
+        setTimeout(() => (state = "running"), 300);
+        return { started: "solo", requested: "solo" };
+      }),
+      place: () => placeWith({ state, mode: "play" }),
+    };
+    const text = textOf((await (await connect(bridge)).callTool({ name: "playtest", arguments: { action: "start" } })) as CallToolResult);
+    expect(text).toStartWith("playtest started solo");
+    expect(text).toContain("state=running");
+  });
+
+  test("wait for=log returns the first new matching line", async () => {
+    let emit: ((ev: BridgeEvent, from: SessionInfo) => void) | null = null;
+    const bridge: Bridge = {
+      ...fakeBridge(() => ({})),
+      onEvent: (fn) => {
+        emit = fn;
+        return () => {};
+      },
+    };
+    const from: SessionInfo = { session: "s", role: "server", pluginVersion: "0", placeId: 42, placeName: "P", connectedAt: 0, lastSeen: 0 };
+    const client = await connect(bridge);
+    const pending = client.callTool({ name: "wait", arguments: { for: "log", pattern: "ready \\d+", timeoutMs: 3_000 } });
+    await Bun.sleep(50);
+    emit!({ ev: "log", ctx: "server", level: "info", msg: "booting", ts: 1 }, from);
+    emit!({ ev: "log", ctx: "server", level: "info", msg: "ready 7", ts: 2 }, from);
+    const text = textOf((await pending) as CallToolResult);
+    expect(text).toContain("wait ok: log matched");
+    expect(text).toContain("[server][info] ready 7");
+    expect(text).not.toContain("booting");
+  });
+
+  test("wait for=attribute re-checks through the plugin until the value matches", async () => {
+    let checks = 0;
+    const bridge = fakeBridge((op, args) => {
+      expect(op).toBe("wait.check");
+      expect(args).toMatchObject({ kind: "attribute", path: "game.Workspace", name: "Ready", value: true });
+      checks += 1;
+      return checks < 3 ? { met: false, value: false } : { met: true, value: true };
+    });
+    const text = textOf(
+      (await (await connect(bridge)).callTool({
+        name: "wait",
+        arguments: { for: "attribute", path: "game.Workspace", name: "Ready", value: true, timeoutMs: 5_000 },
+      })) as CallToolResult,
+    );
+    expect(text).toBe("wait ok: attribute game.Workspace@Ready value=true");
+    expect(checks).toBe(3);
+  });
+
+  test("wait times out with ERR TIMEOUT naming the last observed state", async () => {
+    const bridge: Bridge = { ...fakeBridge(() => ({})), place: () => placeWith({ state: "running" }) };
+    const text = textOf(
+      (await (await connect(bridge)).callTool({
+        name: "wait",
+        arguments: { for: "playtest", state: "idle", timeoutMs: 300 },
+      })) as CallToolResult,
+    );
+    expect(text).toBe("ERR TIMEOUT: playtest is running, not idle");
   });
 });

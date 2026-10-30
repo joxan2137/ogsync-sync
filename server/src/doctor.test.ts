@@ -2,11 +2,11 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { CONFIG_DEFAULTS } from "./proto/types.ts";
+import { CONFIG_DEFAULTS, PROTO_VERSION } from "./proto/types.ts";
 import { Hub } from "./hub/hub.ts";
 import { formatChecks, runDoctor, type Check } from "./doctor.ts";
 
-const PLUGIN_HEADERS = { "x-ogsync-plugin": "1" };
+const PLUGIN_HEADERS = { "x-ogsync-plugin": String(PROTO_VERSION) };
 
 function levelOf(checks: Check[], title: string): string | undefined {
   return checks.find((c) => c.title === title)?.level;
@@ -52,7 +52,7 @@ describe("doctor", () => {
         method: "POST",
         headers: PLUGIN_HEADERS,
         body: JSON.stringify({
-          proto: 1,
+          proto: PROTO_VERSION,
           session: "s1",
           role: "edit",
           pluginVersion: "0.0.0-test",
@@ -63,8 +63,11 @@ describe("doctor", () => {
       const checks = await runDoctor(dir, hub.port);
       expect(levelOf(checks, "project")).toBe("ok");
       expect(levelOf(checks, "daemon")).toBe("warn"); // version differs from this CLI
-      // A rejected handshake leaves no session, so doctor points at the plugin.
-      expect(levelOf(checks, "studio")).toBe("fail");
+      // The daemon serves every place; the project's target just does not match it.
+      const binding = checks.find((c) => c.title === "binding");
+      expect(binding?.level).toBe("fail");
+      expect(binding?.detail).toContain("Expected");
+      expect(binding?.fix).toContain("7 (SomethingElse)");
     } finally {
       hub.stop();
     }
