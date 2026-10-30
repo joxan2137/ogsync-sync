@@ -21,7 +21,8 @@ Conventions used by every tool:
   connected and no target, or a target matching several, the tool answers
   `ERR TARGET` listing the candidates; it never picks one.
 - Tools run inside the machine-wide daemon; `ogsync serve` (MCP) and `ogsync
-  call <tool> '<json>'` (shell) are both thin clients of it, so every agent
+  call <tool> '<json>'` (shell; `-` in place of the JSON reads it from stdin,
+  which large args such as script sources need on Windows) are both thin clients of it, so every agent
   sees the same places, queue and leases. Ops to one place run one at a time,
   round-robin across sessions.
 - **Writes are one undo step** — `set`, `create`, `delete`, `duplicate`,
@@ -97,9 +98,11 @@ the change (`verified(editor)` when the script was open in a Script Editor tab).
 All text (`old`, `new`, `source`) is LF-normalized and sent as base64 of its
 UTF-8 bytes, so NULs, lone CRs and long brackets arrive intact; a source over
 64 KiB of base64 is staged in chunks first, so there is no size ceiling. The
-plugin checks the decoded text against the daemon's hash, writes through
-`ScriptEditorService:UpdateSourceAsync` (which merges into an open editor
-document instead of being overridden by it), then reads the result back —
+plugin checks the decoded text against the daemon's hash, writes `Source`
+directly (undoable with `history undo`) or, when the script is open in an
+editor tab, through `ScriptEditorService:UpdateSourceAsync` (which merges into
+the document instead of being overridden by it; that edit is undone in the
+editor tab, not by `history`), then reads the result back —
 `GetEditorSource` when a document is open, `Source` otherwise — and fails if
 its hash differs.
 
@@ -199,6 +202,9 @@ auto-end).
   Starting again as the owner answers `already running (yours)`; anyone else
   gets `ERR LEASE`. `solo` uses StudioTestService when available, degrades to
   `server` (run mode) when Studio refuses play-solo, and the result says which.
+  `solo` is refused (`ERR STUDIO`) when the Studio window is minimized, covered
+  or the screen is locked, since its client never renders; `server` starts
+  anyway and lists that state as a warning.
 - `stop` refuses (`ERR LEASE`) a playtest another session owns, one the user
   started in Studio, or one whose state is `unknown`, unless `force=true`.
   Stopping an idle place answers `playtest not running`.

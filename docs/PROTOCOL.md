@@ -263,6 +263,17 @@ with a warning.
 `client` jobs over the broker to the player named by `player` (default: the
 first). Anything else goes to the bound edit session.
 
+Run mode (`playtest start mode=server`, i.e. `RunService:Run()`, or F8)
+simulates the server inside the edit DataModel and no play-server peer ever
+registers. While the edit peer reports `running` with `mode: "run"`,
+server-context ops and `:server` targets go to the edit peer; `client`
+context and `:client-N` answer `NOPLUGIN` (run mode has no clients). The
+game-VM bridge then lives at `Workspace.Terrain.__OGSyncEval` (a server Script
+runs under Workspace, and Terrain is never a Rojo/Argon-mapped path, unlike
+ServerScriptService), with every part `Archivable = false` (never saved,
+published, or synced by the OGSync watcher), and is destroyed when the run
+ends; a leftover one is swept when the plugin loads in edit mode.
+
 ## Eval jobs
 
 - `run.exec {code, context, player?, vm?: "game"|"plugin", async?, key?}`.

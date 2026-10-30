@@ -620,17 +620,29 @@ export class Hub implements Bridge {
     const server = slotOf(place.key, "server");
     const requireServer = (why: string): string => {
       if (this.peerAt(server) || this.orphans.has(server)) return server;
+      if (place.tracker.runMode()) return edit;
       throw new BridgeError("NOPLUGIN", `${why} needs a play-server session on ${place.key}; start a playtest first`);
+    };
+    const requireClients = (why: string): string => {
+      if (this.peerAt(server) || this.orphans.has(server)) return server;
+      if (place.tracker.runMode()) {
+        throw new BridgeError(
+          "NOPLUGIN",
+          `${why}: ${place.key} is in run mode (playtest mode=server), which has no clients; start mode=solo for a client`,
+        );
+      }
+      return requireServer(why);
     };
     if (role !== null && role.startsWith("client")) {
       const player = role === "client" ? undefined : Number(role.slice("client-".length));
-      return { slot: requireServer(`target ${role}`), args: asClientContext(args), player };
+      return { slot: requireClients(`target ${role}`), args: asClientContext(args), player };
     }
     if (role === "server") return { slot: requireServer("target server"), args };
     if (role === "edit" || op === "play.stopSignal") return { slot: edit, args };
     if (op === "play.stop") return { slot: this.peerAt(server) ? server : edit, args };
     const ctx = runtimeContext(op, args);
-    if (ctx !== null) return { slot: requireServer(`${op} ctx=${ctx}`), args };
+    if (ctx === "client") return { slot: requireClients(`${op} ctx=client`), args };
+    if (ctx === "server") return { slot: requireServer(`${op} ctx=server`), args };
     return { slot: edit, args };
   }
 

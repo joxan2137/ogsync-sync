@@ -36,7 +36,23 @@ local function nowMillis(): number
 	return DateTime.now().UnixTimestampMillis
 end
 
+-- Non-archivable instances (the run-mode eval bridge) are never saved, so
+-- they are never synced either, wherever they sit.
+local function isArchived(inst: Instance): boolean
+	local current: Instance? = inst
+	while current ~= nil and current ~= game do
+		if current.Archivable == false then
+			return false
+		end
+		current = current.Parent
+	end
+	return true
+end
+
 local function isSynced(inst: Instance): boolean
+	if not isArchived(inst) then
+		return false
+	end
 	for _, root in roots do
 		if inst == root or inst:IsDescendantOf(root) then
 			return true

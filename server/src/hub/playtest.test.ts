@@ -131,6 +131,18 @@ test("a start whose plugin answer is `already` credits the user, not the agent",
   expect(t.snapshot()).toMatchObject({ state: "running", owner: null, startedBy: "user" });
 });
 
+test("run mode is the edit peer reporting a running simulation in mode run", () => {
+  const { t } = tracker();
+  t.report("edit", "running", "play");
+  expect(t.runMode()).toBe(false);
+  t.report("edit", "running", "run");
+  expect(t.runMode()).toBe(true);
+  t.report("edit", "stopping", "run");
+  expect(t.runMode()).toBe(true);
+  t.report("edit", "idle");
+  expect(t.runMode()).toBe(false);
+});
+
 describe("stale code", () => {
   test("compares edit and play-server hashes, ignoring server-only runtime clones", () => {
     const edit = { "game.A": "1", "game.B": "2", "game.C": "3" };

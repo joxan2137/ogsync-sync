@@ -26,7 +26,7 @@ plugin/src/
   Ops/Script.luau         ops   script.read/edit/grep
   Ops/Run/init.luau       ops   run.exec + run.job (plugin VM for edit; game VM for server/client)
   Ops/Run/Jobs.luau       ops   eval job registry: generations, supersede-by-key, guarded timers
-  Ops/Run/Bridge.luau     ops   game-VM eval host — cloned into the play DataModel, never required by the plugin
+  Ops/Run/Bridge.luau     ops   game-VM eval host — cloned into the play DataModel (run mode: Workspace.Terrain of the edit DataModel, non-archivable, removed when the run ends), never required by the plugin
   Ops/Play.luau           core  play.start/stop/status/hashes
   Ops/Log.luau            ops   log.tail + log event forwarding
   Ops/Shot.luau           ops   shot.capture
@@ -173,7 +173,8 @@ PlayState.onChange(fn): () -> ()
   prints from modules it requires.
 - **Write ops** run inside `Util/Recording.run` (one undo step; Cancel on
   throw). Script text goes through `Util/Source`: `take` (decode + hash check),
-  `write` (`UpdateSourceAsync`, then read back via `GetEditorSource` when a
+  `write` (`Source =` inside the recording, or `UpdateSourceAsync` when an
+  editor document is open, then read back via `GetEditorSource` when a
   document is open, else `Source`, and compare hashes).
 - **shot.capture**: try `CaptureService:CaptureScreenshot` → contentId →
   `AssetService:CreateEditableImageAsync` → `ReadPixels` → return

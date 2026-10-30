@@ -236,6 +236,31 @@ test("runtime-context ops route to the play-server session, stopSignal to edit",
   await signal;
 });
 
+test("in run mode the edit peer is the server: server-context ops route to it, clients do not exist", async () => {
+  await handshake();
+  await report("running", "s-edit", { mode: "run" });
+  const exec = hub.call("run.exec", { code: "return 1", context: "server", vm: "game" }, { timeoutMs: 2_000 });
+  const [job] = (await jobsFrom(await pull())).jobs;
+  expect(job).toMatchObject({ op: "run.exec", args: { context: "server" } });
+  await push({ results: [{ id: job!.id, ok: true, data: 1 }] });
+  expect(await exec).toBe(1);
+
+  const job2 = hub.callTarget(parseTarget("Place2:server"), {}, "run.job", { action: "list", context: "server" }, { timeoutMs: 2_000 });
+  const [listed] = (await jobsFrom(await pull("s-edit", 1))).jobs;
+  expect(listed!.op).toBe("run.job");
+  await push({ results: [{ id: listed!.id, ok: true, data: { jobs: [] } }] });
+  await job2;
+
+  const client = expectBridgeError(await capture(hub.call("run.exec", { code: "return 1", context: "client" })));
+  expect(client.code).toBe("NOPLUGIN");
+  expect(client.message).toContain("run mode");
+
+  // Once the run ends, server context needs a play server again.
+  await report("idle");
+  const after = expectBridgeError(await capture(hub.call("run.exec", { code: "return 1", context: "server" })));
+  expect(after.message).toContain("needs a play-server session");
+});
+
 test("client-context ops need a play session", async () => {
   await handshake();
   const call = capture(hub.call("run.exec", { code: "return 1", ctx: "client" }, { timeoutMs: 2_000 }));

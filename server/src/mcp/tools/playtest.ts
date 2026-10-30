@@ -35,10 +35,12 @@ export const tool = defineTool({
     const opts = callOpts(args, LONG_TIMEOUT_MS);
 
     if (args.action === "start") {
-      // A Studio that cannot paint never brings a play test up: say why now.
+      // A Studio that cannot paint never brings a solo test's client up: say why now.
+      // Run mode (`server`) has no client to render, so there it is only a warning.
       const visual = await checkVisual(bridge.bound()?.placeName, { restore: args.restore });
-      if (!visual.ok) throw new BridgeError("STUDIO", `playtest start refused: ${visual.reason}`);
-      const notes = visual.warnings.map((warning) => `warn: ${warning}`);
+      const solo = (args.mode ?? "solo") === "solo";
+      if (!visual.ok && solo) throw new BridgeError("STUDIO", `playtest start refused: ${visual.reason}`);
+      const notes = [...(visual.ok ? [] : [visual.reason]), ...visual.warnings].map((warning) => `warn: ${warning}`);
       const data = (await bridge.call("play.start", { mode: args.mode ?? "solo" }, opts)) as PlaytestResult;
       if (data.already) {
         const head = data.yours === false

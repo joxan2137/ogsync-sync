@@ -177,6 +177,15 @@ export class PlaytestTracker {
     return null;
   }
 
+  /**
+   * Run mode (RunService:Run / F8) simulates the server inside the edit
+   * DataModel: no play-server peer ever registers, the edit peer is the server.
+   */
+  runMode(): boolean {
+    const edit = this.#edit;
+    return edit !== null && edit.mode === "run" && (edit.state === "running" || edit.state === "stopping");
+  }
+
   warn(message: string): void {
     this.#warning = message;
   }

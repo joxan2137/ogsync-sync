@@ -52,6 +52,7 @@ commands:
       --port <n>           preferred daemon port when one has to be started
   daemon run|start|stop    run in the foreground / ensure one is running / stop it
   call <tool> '<json>'     run one tool through the daemon and print the result JSON
+                           (pass - instead of the JSON to read it from stdin)
       --as <id>            lease identity (default cli:<dir>; also OGSYNC_CLIENT)
   status [--json]          daemon, places, peers and playtest state
   init                     scaffold ${CONFIG_FILE}, ${PROJECT_FILE} and src/ in this directory
@@ -167,11 +168,13 @@ async function daemon(args: Args): Promise<number> {
 }
 
 async function call(args: Args): Promise<number> {
-  const [tool, raw] = args.positionals;
+  const [tool, given] = args.positionals;
   if (tool === undefined) {
-    log.error("usage: ogsync call <tool> '<json-args>'");
+    log.error("usage: ogsync call <tool> '<json-args>' (or - to read the JSON from stdin)");
     return 1;
   }
+  // Windows caps a command line near 32 KB, so large args (script sources) come through stdin.
+  const raw = given === "-" ? await Bun.stdin.text() : given;
   let toolArgs: unknown = {};
   if (raw !== undefined) {
     try {
@@ -335,7 +338,7 @@ function parseArgs(argv: string[]): Args {
   const positionals: string[] = [];
   for (let i = 0; i < argv.length; i += 1) {
     const token = argv[i]!;
-    if (!token.startsWith("-")) {
+    if (token === "-" || !token.startsWith("-")) {
       positionals.push(token);
       continue;
     }

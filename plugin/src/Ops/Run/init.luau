@@ -9,6 +9,7 @@ local HttpService = game:GetService("HttpService")
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local ServerScriptService = game:GetService("ServerScriptService")
+local Workspace = game:GetService("Workspace")
 
 local Src = script.Parent.Parent :: any
 local Serde = require(Src.Util.Serde)
@@ -24,6 +25,20 @@ local BRIDGE_NAME = "__OGSyncEval"
 local BRIDGE_PROTO = 1
 local BRIDGE_START_TIMEOUT = 5
 local CONTAINER_TIMEOUT = 5
+local RUN_END_POLL = 0.5
+
+-- Loaded while not running (or in F8 Run mode) means this is the edit
+-- DataModel. Run mode simulates the server right here, so the game-VM bridge
+-- lands in the DataModel that Argon/Rojo two-way sync mirrors to disk.
+local inEditDataModel = (function(): boolean
+	if not RunService:IsRunning() then
+		return true
+	end
+	local ok, runMode = pcall(function(): boolean
+		return RunService:IsRunMode()
+	end)
+	return ok and runMode == true
+end)()
 
 local luauLoad = loadstring
 local setEnv = setfenv
@@ -110,7 +125,13 @@ local function startInPlugin(job: Job, code: string)
 	end
 end
 
+-- Run mode: Workspace.Terrain. A server Script runs anywhere under Workspace,
+-- and Terrain is never a mapped path in a Rojo/Argon project (it has no file
+-- form), unlike ServerScriptService, the most-synced service there is.
 local function bridgeContainer(): Instance
+	if inEditDataModel then
+		return Workspace.Terrain
+	end
 	if RunService:IsServer() then
 		return ServerScriptService
 	end
@@ -143,14 +164,14 @@ local function startBridge(): BindableFunction
 		host.Name = BRIDGE_NAME
 		host.Archivable = false
 		host:SetAttribute("Proto", BRIDGE_PROTO)
-		local core = script.Bridge:Clone()
-		core.Parent = host
-		Src.Util.Serde:Clone().Parent = host
-		Src.Util.Path:Clone().Parent = host
-		local created = Instance.new("BindableFunction")
-		created.Name = "Invoke"
-		created.Parent = host
-		invoke = created
+		local parts = { script.Bridge:Clone(), Src.Util.Serde:Clone(), Src.Util.Path:Clone(), Instance.new("BindableFunction") }
+		parts[4].Name = "Invoke"
+		for _, part in parts do
+			-- Nothing of the bridge may be saved, published or synced to disk.
+			part.Archivable = false
+			part.Parent = host
+		end
+		invoke = parts[4]
 		local okSource, sourceErr = pcall(function()
 			(host :: any).Source = "require(script.Bridge)(script, require(script.Serde))\n"
 		end)
@@ -182,6 +203,38 @@ local function startBridge(): BindableFunction
 	return invoke
 end
 
+-- In the edit DataModel the bridge must not outlive the run: Studio's Stop
+-- resets the simulation, and this removes it even if that reset does not.
+local function removeWhenRunEnds(invoke: BindableFunction)
+	local host = invoke.Parent
+	task.spawn(function()
+		while RunService:IsRunning() and host ~= nil and host.Parent ~= nil do
+			task.wait(RUN_END_POLL)
+		end
+		if bridgeInvoke == invoke then
+			bridgeInvoke = nil
+		end
+		if host ~= nil then
+			pcall(function()
+				host:Destroy()
+			end)
+		end
+	end)
+end
+
+-- A bridge left in the edit DataModel by an unloaded plugin or a crash.
+local function sweepEditBridge()
+	if not inEditDataModel or RunService:IsRunning() then
+		return
+	end
+	local stale = Workspace.Terrain:FindFirstChild(BRIDGE_NAME)
+	if stale ~= nil then
+		pcall(function()
+			stale:Destroy()
+		end)
+	end
+end
+
 -- Concurrent evals during the Ready wait share the one start in flight instead
 -- of each replacing the host the previous caller is waiting on.
 local function ensureBridge(): BindableFunction
@@ -199,6 +252,9 @@ local function ensureBridge(): BindableFunction
 		error(result, 0)
 	end
 	bridgeInvoke = result
+	if inEditDataModel then
+		removeWhenRunEnds(result)
+	end
 	return result
 end
 
@@ -337,6 +393,8 @@ local function exec(args: any, context: string): any
 end
 
 return function(register: Register)
+	sweepEditBridge()
+
 	register("run.exec", function(args: any): any
 		-- Dispatcher routes client jobs on `args.ctx`; the tool contract calls it
 		-- `context` — accept either so neither spelling silently runs in edit.
