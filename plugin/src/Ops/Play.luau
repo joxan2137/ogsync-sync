@@ -4,6 +4,7 @@
 -- mode, and say which one happened. Start and stop are idempotent: asking for
 -- what is already true answers truthfully instead of erroring.
 
+local HttpService = game:GetService("HttpService")
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local Workspace = game:GetService("Workspace")
@@ -33,7 +34,11 @@ local function studioTestService(): any
 	return if ok then service else nil
 end
 
-local function launchPlayTest(): string?
+-- Test args reach the play DataModels (StudioTestService:GetTestArgs) and
+-- nothing persists in the place: the play server presents this token at its
+-- handshake, so the daemon pairs it with this place even when an unsaved or
+-- local-file place gives every play DataModel the generic name "Game".
+local function launchPlayTest(launch: string): string?
 	local service = studioTestService()
 	if service == nil or type(service.ExecutePlayModeAsync) ~= "function" then
 		return nil
@@ -43,7 +48,7 @@ local function launchPlayTest(): string?
 	PlayState.setTestActive(true)
 	task.spawn(function()
 		local ok, err = pcall(function()
-			service:ExecutePlayModeAsync({})
+			service:ExecutePlayModeAsync({ ogsyncLaunch = launch })
 		end)
 		finished = true
 		failure = if ok then nil else tostring(err)
@@ -118,7 +123,12 @@ return function(register: Register)
 		PlayState.setIntent("starting")
 
 		if mode == "solo" then
-			local via = launchPlayTest() or attemptSolo()
+			local launch = HttpService:GenerateGUID(false)
+			local via = launchPlayTest(launch)
+			if via then
+				return { started = "solo", requested = "solo", via = via, launch = launch }
+			end
+			via = attemptSolo()
 			if via then
 				return { started = "solo", requested = "solo", via = via }
 			end
@@ -144,6 +154,12 @@ return function(register: Register)
 	register("play.stop", function(_args: any): any
 		if not RunService:IsRunning() and not PlayState.testActive() then
 			return { stopped = false, mode = currentMode(), note = "no playtest running in this session" }
+		end
+		if not RunService:IsRunning() then
+			-- The test runs in its own DataModels; only the play server's plugin
+			-- can end it. NOPLUGIN makes the daemon fall back to play.stopSignal,
+			-- which that plugin's stop monitor acts on.
+			error("NOPLUGIN: the play test runs in its own DataModel; it ends through the play-server session", 0)
 		end
 		PlayState.setIntent("stopping")
 		local via = endTest()

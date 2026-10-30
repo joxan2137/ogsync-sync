@@ -57,10 +57,26 @@ end
 local role = detectRole()
 local session = HttpService:GenerateGUID(false)
 local port = readPort()
+-- A play DataModel launched by OGSync carries the edit plugin's launch token
+-- in its test args; presenting it pairs this session with the right place.
+local function testLaunchToken(): string?
+	if role == "edit" then
+		return nil
+	end
+	local ok, testArgs = pcall(function(): any
+		return (game:GetService("StudioTestService" :: any) :: any):GetTestArgs()
+	end)
+	if ok and type(testArgs) == "table" and type((testArgs :: any).ogsyncLaunch) == "string" then
+		return (testArgs :: any).ogsyncLaunch
+	end
+	return nil
+end
+
 local config = {
 	port = port,
 	session = session,
 	role = role,
+	launch = testLaunchToken(),
 }
 
 Dispatcher.setup({ plugin = plugin, role = role, session = session })

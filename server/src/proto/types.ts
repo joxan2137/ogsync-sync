@@ -37,6 +37,8 @@ export interface HandshakeRequest {
   session: string;
   /** Secret from this session's previous handshake; proves a reconnect, not a new plugin load. */
   token?: string;
+  /** Play DataModels: the launch token the edit plugin passed through StudioTestService test args. */
+  launch?: string;
   role: Role;
   pluginVersion: string;
   placeId: number;

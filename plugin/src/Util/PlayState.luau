@@ -8,7 +8,12 @@ export type Snapshot = { state: string, mode: string? }
 
 local PlayState = {}
 
+-- An intent nothing confirms (a stop the test never honours) stops counting
+-- after this, so the reported state falls back to what is actually running.
+local INTENT_TIMEOUT_SECONDS = 20
+
 local intent = "idle" -- "idle" | "starting" | "stopping"
+local intentAt = 0
 local testActive = false
 local listeners: { () -> () } = {}
 
@@ -19,6 +24,7 @@ local function changed()
 end
 
 function PlayState.setIntent(value: string)
+	intentAt = os.clock()
 	if intent ~= value then
 		intent = value
 		changed()
@@ -68,6 +74,9 @@ function PlayState.snapshot(running: boolean): Snapshot
 		intent = "idle"
 	end
 	if intent == "stopping" and not running and not testActive then
+		intent = "idle"
+	end
+	if intent ~= "idle" and os.clock() - intentAt > INTENT_TIMEOUT_SECONDS then
 		intent = "idle"
 	end
 	return PlayState.derive(running, testActive, intent)

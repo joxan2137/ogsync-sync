@@ -41,7 +41,8 @@ local function testJobLog()
 end
 
 local function testPlayState()
-	local PlayState = Harness.new().load("Util/PlayState")
+	local env = Harness.new()
+	local PlayState = env.load("Util/PlayState")
 	local derive = PlayState.derive
 	check("idle", derive(false, false, "idle").state == "idle")
 	check("start in flight", derive(false, false, "starting").state == "starting")
@@ -57,6 +58,13 @@ local function testPlayState()
 	PlayState.setIntent("stopping")
 	PlayState.setTestActive(false)
 	check("a finished test ends the stop", PlayState.snapshot(false).state == "idle")
+
+	PlayState.setTestActive(true)
+	PlayState.setIntent("stopping")
+	check("a stop in flight reads stopping", PlayState.snapshot(false).state == "stopping")
+	env.advance(21)
+	check("an unconfirmed stop expires back to running", PlayState.snapshot(false).state == "running")
+	PlayState.setTestActive(false)
 
 	local fired = 0
 	local stop = PlayState.onChange(function()

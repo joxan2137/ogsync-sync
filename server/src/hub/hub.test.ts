@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import {
   BridgeError,
   CONFIG_DEFAULTS,
@@ -602,4 +602,52 @@ test("a start the plugin answers `already` leaves no lease and credits the user"
   await push({ results: [{ id: job.id, ok: true, data: { already: true, mode: "play" } }] });
   expect(await start).toMatchObject({ already: true, yours: false });
   expect(hub.place()?.playtest).toMatchObject({ state: "running", owner: null, startedBy: "user" });
+});
+
+describe("pairing play peers of unsaved places (placeId 0)", () => {
+  const LOCAL = { placeId: 0, placeName: "OGSyncTest.rbxl" };
+
+  test("the launch token from play.start pairs the generic-named play server with its edit place", async () => {
+    restart({ target_place: "ogsynctest.rbxl" });
+    expect((await handshake(LOCAL)).placeKey).toBe("ogsynctest.rbxl");
+    await report("idle");
+    const start = runAs(caller("a"), () => hub.call("play.start", { mode: "solo" }, { timeoutMs: 2_000 }));
+    await answerNext("s-edit", { started: "solo", launch: "tok-1" });
+    await start;
+    // Another placeId-0 edit place is open too: only the token can tell them apart.
+    await handshake({ session: "s-other", placeId: 0, placeName: "Scratch" });
+    const play = await handshake({ session: "s-play", role: "server", placeId: 0, placeName: "Game", launch: "tok-1" });
+    expect(play.placeKey).toBe("ogsynctest.rbxl");
+    expect(hub.state().places.map((place) => place.key).sort()).toEqual(["ogsynctest.rbxl", "scratch"]);
+    expect(hub.place()?.name).toBe("OGSyncTest.rbxl");
+
+    const exec = hub.call("run.exec", { code: "return 1", context: "server" }, { timeoutMs: 2_000 });
+    expect(await answerNext("s-play", 1)).toBe("run.exec");
+    expect(await exec).toBe(1);
+    // play.stop reaches the paired play server.
+    const stop = runAs(caller("a"), () => hub.call("play.stop", {}, { timeoutMs: 2_000 }));
+    expect(await answerNext("s-play", { stopped: true })).toBe("play.stop");
+    await stop;
+  });
+
+  test("without a token it joins the only placeId-0 edit place lacking a play server", async () => {
+    restart({ target_place: null });
+    await handshake(LOCAL);
+    const play = await handshake({ session: "s-play", role: "server", placeId: 0, placeName: "Game" });
+    expect(play.placeKey).toBe("ogsynctest.rbxl");
+    expect(hub.state().places).toHaveLength(1);
+  });
+
+  test("several candidates stay separate, with a warning naming them; another placeId never merges", async () => {
+    restart({ target_place: null });
+    await handshake(LOCAL);
+    await handshake({ session: "s-other", placeId: 0, placeName: "Scratch" });
+    const play = await handshake({ session: "s-play", role: "server", placeId: 0, placeName: "Game" });
+    expect(play.placeKey).toBe("game");
+    const game = hub.state().places.find((place) => place.key === "game")!;
+    expect(game.playtest.warning).toContain("ogsynctest.rbxl or scratch");
+
+    const published = await handshake({ session: "s-pub", role: "server", placeId: 77, placeName: "Game", launch: "tok-x" });
+    expect(published.placeKey).toBe("77");
+  });
 });

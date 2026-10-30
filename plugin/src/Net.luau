@@ -31,7 +31,8 @@ local MAX_QUEUED_EVENTS = 500
 local MAX_QUEUED_RESULTS = 200
 local BODY_BUDGET = Output.MAX_BYTES - 4096
 
-export type Config = { port: number, session: string, role: string }
+-- launch: the token a play DataModel received in its test args (see Ops/Play).
+export type Config = { port: number, session: string, role: string, launch: string? }
 
 export type Status = {
 	connected: boolean,
@@ -53,6 +54,7 @@ local backoff = BACKOFF_MIN
 local baseUrl = ""
 local preferredPort: number? = nil
 local session = ""
+local launch: string? = nil
 -- Handshake-issued secret: every pull and push presents it, and a re-handshake
 -- sends it back to prove a reconnect of this registration.
 local sessionToken: string? = nil
@@ -348,6 +350,7 @@ local function doHandshake(): boolean
 		pluginVersion = Version,
 		placeId = game.PlaceId,
 		placeName = game.Name,
+		launch = launch,
 		token = sessionToken,
 	})
 
@@ -532,6 +535,7 @@ function Net.start(config: Config)
 	-- A new registration: whatever the last start held is void at the daemon.
 	sessionToken = nil
 	role = config.role
+	launch = config.launch
 	resetBackoff()
 	eventQueue = {}
 	resultQueue = {}

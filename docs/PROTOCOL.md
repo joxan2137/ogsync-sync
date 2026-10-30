@@ -44,6 +44,15 @@ daemon is found the same way.
 - `place key` — `placeId`, or the normalized name (`" @ date"` suffix and case
   stripped) for an unsaved place. Edit and play DataModels of one place share
   it. A second Studio with the same place gets `<key>~2`, `~3`, …
+- Pairing play peers: a published place's play DataModels share its placeId.
+  An unsaved or local-file place (placeId 0) names them generically ("Game"),
+  so `play.start` passes a launch token in the StudioTestService test args
+  (`{ogsyncLaunch}`; nothing persists in the place), returns it as `launch`,
+  and the play server sends it as handshake `launch`. Without a token, a
+  placeId-0 play peer joins the only placeId-0 edit place that has no play
+  server (preferring a starting/running one); with several candidates it stays
+  separate and its `playtest.warning` names them. A place with another placeId
+  is never joined.
 - `role` — `edit` | `server` | `client`. Play clients never HTTP: they are
   reached through the play server's RemoteFunction broker, addressed as
   `client` or `client-N` (Nth player) in a target.
@@ -228,7 +237,11 @@ daemon renders `…more` cursors.
 The daemon keeps one state machine per place, driven by what the plugin
 reports (`playtestState` heartbeats) plus play-server peer presence:
 `idle → starting → running → stopping → idle`, `unknown` when heartbeats
-stop. A start that is not reported running within 30 s returns to `idle`
+stop. `stopping` is bounded: a stop not confirmed within 30 s (daemon intent
+or a plugin reporting `stopping`) reads `running` again with a warning. The
+edit plugin's `play.start`/`play.stop` intents likewise expire after 20 s. An
+edit-side `play.stop` for a test in its own DataModels answers `NOPLUGIN` so
+the daemon falls back to `play.stopSignal`. A start that is not reported running within 30 s returns to `idle`
 with a warning.
 
 - **Leases.** `play.start` records the calling client as owner; its 30 s

@@ -60,6 +60,8 @@ export class PlaytestTracker {
   /** The plugin answered that this start launched the test (not `already`). */
   #startConfirmed = false;
   #stoppingAt: number | null = null;
+  /** When the edit plugin started reporting "stopping"; a stop it never finishes stops counting. */
+  #editStoppingSince: number | null = null;
   #startedBy: "agent" | "user" | null = null;
   #phase: PlaytestPhase = "unknown";
   #since: number;
@@ -77,7 +79,11 @@ export class PlaytestTracker {
 
   report(from: "edit" | "server", state: PlaytestReport, mode?: string, players?: number): void {
     this.#heartbeat = this.#now();
-    if (from === "edit") this.#edit = { state, mode: mode ?? null };
+    if (from === "edit") {
+      if (state !== "stopping") this.#editStoppingSince = null;
+      else if (this.#edit?.state !== "stopping") this.#editStoppingSince = this.#heartbeat;
+      this.#edit = { state, mode: mode ?? null };
+    }
     else if (typeof players === "number") this.#players = players;
     this.#refresh();
   }
@@ -219,8 +225,14 @@ export class PlaytestTracker {
     return phase;
   }
 
+  /** A plugin reporting "stopping" still has the test up. */
   #isRunning(): boolean {
-    return this.#serverPresent || this.#edit?.state === "running";
+    const editState = this.#edit?.state;
+    return this.#serverPresent || editState === "running" || editState === "stopping";
+  }
+
+  #editStopPending(now: number): boolean {
+    return this.#editStoppingSince !== null && now - this.#editStoppingSince < this.#stopTimeoutMs;
   }
 
   #expireIntents(now: number): void {
@@ -228,6 +240,9 @@ export class PlaytestTracker {
     if (this.#stoppingAt !== null && now - this.#stoppingAt >= this.#stopTimeoutMs) {
       this.#stoppingAt = null;
       if (running) this.#warning = `stop requested ${Math.round(this.#stopTimeoutMs / 1000)}s ago but the playtest is still running`;
+    }
+    if (this.#editStoppingSince !== null && !this.#editStopPending(now) && this.#stoppingAt === null && running) {
+      this.#warning = `Studio has reported stopping for over ${Math.round(this.#stopTimeoutMs / 1000)}s without ending the playtest; it still counts as running (playtest stop force=true, or end it in Studio)`;
     }
     if (this.#startingAt !== null && !running && now - this.#startingAt >= this.#startTimeoutMs) {
       this.#startingAt = null;
@@ -239,11 +254,10 @@ export class PlaytestTracker {
   #derive(now: number): PlaytestPhase {
     if (this.#heartbeat === null || now - this.#heartbeat > this.#staleMs) return "unknown";
     const editState = this.#edit?.state;
-    const running = this.#isRunning();
-    if (this.#stoppingAt !== null && (running || editState === "stopping")) return "stopping";
-    if (running) return "running";
+    // Both stop signals are bounded: past the stop timeout a test that is
+    // still up reads as running again, with a warning, never stopping forever.
+    if (this.#isRunning()) return this.#stoppingAt !== null || this.#editStopPending(now) ? "stopping" : "running";
     if (editState === "starting" || this.#startingAt !== null || this.#startQueued) return "starting";
-    if (editState === "stopping") return "stopping";
     return "idle";
   }
 

@@ -44,7 +44,6 @@ import { PlaytestTracker, compareHashes, type TrackerOptions } from "./playtest.
 import { FairScheduler } from "./scheduler.ts";
 import {
   basePlaceKey,
-  normalizePlaceName,
   parseTarget,
   resolvePlace,
   type PlaceIdentity,
@@ -193,6 +192,8 @@ interface PlaceRecord {
   scheduler: FairScheduler<PendingCall>;
   /** Set when the last peer left; the record lingers so its state reads "unknown". */
   emptySince: number | null;
+  /** Token of the play test this place's edit plugin last launched; its play peers present it. */
+  launch: string | null;
 }
 
 interface PendingCall {
@@ -502,6 +503,7 @@ export class Hub implements Bridge {
         place.tracker.startFailed();
         return { ...data, yours: false };
       }
+      if (isRecord(data) && typeof data["launch"] === "string") place.launch = data["launch"];
       place.tracker.startSucceeded();
       return data;
     } catch (err) {
@@ -792,19 +794,23 @@ export class Hub implements Bridge {
 
     const now = Date.now();
     const existing = this.registry.get(req.session);
+    // The secret proves the same plugin load, and one load never changes place.
     const readopted =
       existing !== undefined &&
       typeof req.token === "string" &&
       req.token === existing.token &&
       existing.info.role === req.role &&
-      existing.info.placeKey.split("~")[0] === basePlaceKey(req);
+      existing.info.placeId === req.placeId;
     if (existing && !readopted) {
       // A fresh registration under a known id (plugin restarted its loop without
       // the old secret): park the old one's calls for the new one to adopt.
-      const samePlace = existing.info.role === req.role && existing.info.placeKey.split("~")[0] === basePlaceKey(req);
+      const samePlace = existing.info.role === req.role && existing.info.placeId === req.placeId;
       this.dropPeer(req.session, "re-registered", samePlace ? "orphan" : "fail");
     }
-    const placeKey = readopted ? existing.info.placeKey : this.assignKey(basePlaceKey(req), req.role, req.session);
+    const pairing = readopted ? null : this.pairPlayPeer(req);
+    const placeKey = readopted
+      ? existing.info.placeKey
+      : this.assignKey(pairing?.key ?? basePlaceKey(req), req.role, req.session);
     const info: Peer["info"] = {
       session: req.session,
       role: req.role,
@@ -816,6 +822,7 @@ export class Hub implements Bridge {
       lastSeen: now,
     };
     const place = this.ensurePlace(placeKey, req);
+    if (pairing?.warning) place.tracker.warn(pairing.warning);
 
     if (readopted) {
       // Same plugin load reconnecting: everything it was given and has not
@@ -864,6 +871,36 @@ export class Hub implements Bridge {
     };
   }
 
+  /**
+   * Which place a play-mode peer belongs to. Published places pair by placeId.
+   * An unsaved or local-file place (placeId 0) gives its play DataModels a
+   * generic name ("Game"), so they pair by the launch token the edit plugin
+   * passed in the test args, else by being the only placeId-0 edit place
+   * without a play server (preferring one that is starting or running).
+   * Never a place with another placeId; with several candidates, none.
+   */
+  private pairPlayPeer(req: HandshakeRequest): { key: string | null; warning?: string } | null {
+    if (req.role === "edit") return null;
+    const editPlaces = [...this.places.values()].filter(
+      (place) => place.placeId === req.placeId && this.peerAt(slotOf(place.key, "edit")) !== null,
+    );
+    if (typeof req.launch === "string" && req.launch !== "") {
+      const launched = editPlaces.find((place) => place.launch === req.launch);
+      if (launched) return { key: launched.key };
+    }
+    if (req.placeId > 0) return null;
+    if (editPlaces.some((place) => place.key === basePlaceKey(req))) return null;
+    const free = editPlaces.filter((place) => this.peerAt(slotOf(place.key, "server")) === null);
+    const active = free.filter((place) => ["starting", "running", "stopping"].includes(place.tracker.snapshot().state));
+    const chosen = active.length === 1 ? active[0] : active.length === 0 && free.length === 1 ? free[0] : undefined;
+    if (chosen) return { key: chosen.key };
+    if (free.length === 0) return null;
+    return {
+      key: null,
+      warning: `play server "${req.placeName}" (placeId 0) could belong to ${free.map((place) => place.key).join(" or ")}; kept separate. Save or publish the place, or start the playtest through OGSync, to pair it`,
+    };
+  }
+
   /** Several Studios with one placeId each get their own key: `<id>`, `<id>~2`, … */
   private assignKey(base: string, role: Role, session: string): string {
     for (let n = 1; ; n += 1) {
@@ -884,11 +921,12 @@ export class Hub implements Bridge {
         tracker: new PlaytestTracker(this.trackerOptions),
         scheduler: new FairScheduler<PendingCall>(PLACE_CONCURRENCY),
         emptySince: null,
+        launch: null,
       };
       this.places.set(key, place);
     }
-    // Play DataModels carry a dated name; the edit peer's is the one to show.
-    if (req.role === "edit" || normalizePlaceName(place.name) !== normalizePlaceName(name)) place.name = name;
+    // Play DataModels carry a dated or generic name; the edit peer's is the one to show.
+    if (req.role === "edit") place.name = name;
     place.emptySince = null;
     return place;
   }

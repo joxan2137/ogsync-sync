@@ -143,6 +143,21 @@ test("run mode is the edit peer reporting a running simulation in mode run", () 
   expect(t.runMode()).toBe(false);
 });
 
+test("a stop Studio never finishes reads running again with a warning, not stopping forever", () => {
+  const { t, clock } = tracker();
+  t.report("edit", "running", "play");
+  t.report("edit", "stopping", "play");
+  expect(t.snapshot().state).toBe("stopping");
+  t.beginStop();
+  for (let i = 0; i < 7; i += 1) {
+    clock.now += 5_000;
+    t.report("edit", "stopping", "play");
+  }
+  const snapshot = t.snapshot();
+  expect(snapshot.state).toBe("running");
+  expect(snapshot.warning).toContain("still");
+});
+
 describe("stale code", () => {
   test("compares edit and play-server hashes, ignoring server-only runtime clones", () => {
     const edit = { "game.A": "1", "game.B": "2", "game.C": "3" };
