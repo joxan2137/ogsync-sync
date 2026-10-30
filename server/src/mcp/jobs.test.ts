@@ -4,10 +4,10 @@ import { formatHandle, parseHandle, renderRun } from "./jobs.ts";
 describe("job handles", () => {
   test("round-trip every context", () => {
     for (const handle of [
-      { context: "edit" as const, id: "1" },
-      { context: "server" as const, id: "42" },
-      { context: "client" as const, id: "3" },
-      { context: "client" as const, player: "Player1", id: "3" },
+      { context: "edit" as const, id: "1", nonce: "1a2b3c4d" },
+      { context: "server" as const, id: "42", nonce: "1a2b3c4d" },
+      { context: "client" as const, id: "3", nonce: "1a2b3c4d" },
+      { context: "client" as const, player: "Player1", id: "3", nonce: "1a2b3c4d" },
     ]) {
       expect(parseHandle(formatHandle(handle))).toEqual(handle);
     }
@@ -16,8 +16,10 @@ describe("job handles", () => {
   test("reject handles that cannot be routed", () => {
     expect(parseHandle("7")).toBeNull();
     expect(parseHandle("studio:7")).toBeNull();
-    expect(parseHandle("server@Player1:7")).toBeNull();
+    expect(parseHandle("server@Player1:7.1a2b3c4d")).toBeNull();
     expect(parseHandle("server:")).toBeNull();
+    expect(parseHandle("server:7")).toBeNull();
+    expect(parseHandle("server:7.")).toBeNull();
   });
 });
 

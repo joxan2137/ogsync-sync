@@ -29,8 +29,10 @@ local luauLoad = loadstring
 local setEnv = setfenv
 local getEnv = getfenv
 
-local registry = Jobs.new()
+-- The nonce tells handles from an earlier playtest (whose ids restart at 1) apart.
+local registry = Jobs.new(string.lower(string.sub(HttpService:GenerateGUID(false), 1, 8)))
 local bridgeInvoke: BindableFunction? = nil
+local bridgeStarting = false
 
 local function encodeValue(value: any): any
 	local ok, encoded = pcall(Serde.encode, value, ENCODE_DEPTH)
@@ -124,41 +126,43 @@ end
 -- because Studio compiles them from Source; if this Studio build refuses, the
 -- bridge never reports Ready and the eval fails loudly instead of silently
 -- falling back to the plugin VM.
-local function ensureBridge(): BindableFunction
-	local cached = bridgeInvoke
-	if cached ~= nil and cached.Parent ~= nil and cached.Parent.Parent ~= nil then
-		return cached
-	end
+local function startBridge(): BindableFunction
 	local container = bridgeContainer()
+	local host: Instance
+	local invoke: Instance?
 	local existing = container:FindFirstChild(BRIDGE_NAME)
-	if existing ~= nil then
-		local invoke = existing:FindFirstChild("Invoke")
-		if existing:GetAttribute("Proto") == BRIDGE_PROTO and existing:GetAttribute("Ready") == true and invoke ~= nil and invoke:IsA("BindableFunction") then
-			bridgeInvoke = invoke
-			return invoke
+	if existing ~= nil and existing:GetAttribute("Proto") == BRIDGE_PROTO then
+		-- Ours (e.g. from before a plugin reload), maybe still starting: wait on it.
+		host = existing
+		invoke = existing:FindFirstChild("Invoke")
+	else
+		if existing ~= nil then
+			existing:Destroy()
 		end
-		existing:Destroy()
+		host = Instance.new(if RunService:IsServer() then "Script" else "LocalScript")
+		host.Name = BRIDGE_NAME
+		host.Archivable = false
+		host:SetAttribute("Proto", BRIDGE_PROTO)
+		local core = script.Bridge:Clone()
+		core.Parent = host
+		Src.Util.Serde:Clone().Parent = host
+		Src.Util.Path:Clone().Parent = host
+		local created = Instance.new("BindableFunction")
+		created.Name = "Invoke"
+		created.Parent = host
+		invoke = created
+		local okSource, sourceErr = pcall(function()
+			(host :: any).Source = "require(script.Bridge)(script, require(script.Serde))\n"
+		end)
+		if not okSource then
+			host:Destroy()
+			error("game-VM eval unsupported: cannot set the bridge script's Source (" .. tostring(sourceErr) .. ")", 0)
+		end
+		host.Parent = container
 	end
-
-	local host = Instance.new(if RunService:IsServer() then "Script" else "LocalScript")
-	host.Name = BRIDGE_NAME
-	host.Archivable = false
-	host:SetAttribute("Proto", BRIDGE_PROTO)
-	local core = script.Bridge:Clone()
-	core.Parent = host
-	Src.Util.Serde:Clone().Parent = host
-	Src.Util.Path:Clone().Parent = host
-	local invoke = Instance.new("BindableFunction")
-	invoke.Name = "Invoke"
-	invoke.Parent = host
-	local okSource, sourceErr = pcall(function()
-		(host :: any).Source = "require(script.Bridge)(script, require(script.Serde))\n"
-	end)
-	if not okSource then
-		host:Destroy()
-		error("game-VM eval unsupported: cannot set the bridge script's Source (" .. tostring(sourceErr) .. ")", 0)
+	if invoke == nil or not invoke:IsA("BindableFunction") then
+		error("game-VM eval unsupported: " .. host:GetFullName() .. " has no Invoke BindableFunction", 0)
 	end
-	host.Parent = container
 
 	local deadline = os.clock() + BRIDGE_START_TIMEOUT
 	while host:GetAttribute("Ready") ~= true and os.clock() < deadline do
@@ -175,8 +179,27 @@ local function ensureBridge(): BindableFunction
 			0
 		)
 	end
-	bridgeInvoke = invoke
 	return invoke
+end
+
+-- Concurrent evals during the Ready wait share the one start in flight instead
+-- of each replacing the host the previous caller is waiting on.
+local function ensureBridge(): BindableFunction
+	while bridgeStarting do
+		task.wait(WAIT_STEP)
+	end
+	local cached = bridgeInvoke
+	if cached ~= nil and cached.Parent ~= nil and cached.Parent.Parent ~= nil then
+		return cached
+	end
+	bridgeStarting = true
+	local ok, result = pcall(startBridge)
+	bridgeStarting = false
+	if not ok then
+		error(result, 0)
+	end
+	bridgeInvoke = result
+	return result
 end
 
 local function absorb(job: Job, reply: any)
@@ -302,7 +325,7 @@ local function exec(args: any, context: string): any
 		error(err, 0)
 	end
 	if args.async == true then
-		return { job = job.id, gen = job.gen, key = job.key, vm = vm, context = context, async = true }
+		return { job = job.id, gen = job.gen, nonce = registry.nonce, key = job.key, vm = vm, context = context, async = true }
 	end
 
 	waitSettled(job, math.huge)
@@ -346,9 +369,19 @@ return function(register: Register)
 	register("run.job", function(args: any): any
 		local action = args.action or "poll"
 		if action == "list" then
-			return { jobs = registry:list() }
+			return { jobs = registry:list(), nonce = registry.nonce }
 		end
 		local id = tostring(args.id)
+		if args.nonce ~= registry.nonce then
+			error(
+				string.format(
+					"job %s is from an earlier playtest or plugin load (handle nonce %s, this session %s); its job is gone",
+					id,
+					tostring(args.nonce),
+					registry.nonce
+				)
+			)
+		end
 		local job = registry:get(id)
 		if job == nil then
 			error(string.format("no job %s in this session (finished jobs are kept until collected, newest 32 only)", id))

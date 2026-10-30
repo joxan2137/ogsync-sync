@@ -41,7 +41,7 @@ async function call(bridge: Bridge, name: string, args: Record<string, unknown>)
 
 describe("run and job", () => {
   test("run async returns a routable job handle immediately", async () => {
-    const { bridge, calls } = recordingBridge(() => ({ job: "7", gen: 7, vm: "game", async: true }));
+    const { bridge, calls } = recordingBridge(() => ({ job: "7", gen: 7, nonce: "1a2b3c4d", vm: "game", async: true }));
     const text = await call(bridge, "run", {
       code: "while true do task.wait() end",
       context: "client",
@@ -49,7 +49,7 @@ describe("run and job", () => {
       async: true,
       key: "sampler",
     });
-    expect(text).toStartWith("job client@Player1:7 started vm=game gen=7");
+    expect(text).toStartWith("job client@Player1:7.1a2b3c4d started vm=game gen=7");
     expect(calls[0]!.args).toMatchObject({ context: "client", async: true, key: "sampler", player: "Player1" });
   });
 
@@ -80,30 +80,30 @@ describe("run and job", () => {
       output: [{ level: "info", text: "sampled" }],
       returns: [5],
     }));
-    const text = await call(bridge, "job", { action: "collect", handle: "server:3", wait_ms: 30_000 });
-    expect(text).toBe("job server:3 done\tvm=game elapsed_s=41.3\nsampled\n=> 5");
+    const text = await call(bridge, "job", { action: "collect", handle: "server:3.1a2b3c4d", wait_ms: 30_000 });
+    expect(text).toBe("job server:3.1a2b3c4d done\tvm=game elapsed_s=41.3\nsampled\n=> 5");
     expect(calls[0]!.op).toBe("run.job");
-    expect(calls[0]!.args).toMatchObject({ action: "collect", id: "3", context: "server", wait_ms: 30_000 });
+    expect(calls[0]!.args).toMatchObject({ action: "collect", id: "3", nonce: "1a2b3c4d", context: "server", wait_ms: 30_000 });
     expect(calls[0]!.timeoutMs).toBeGreaterThan(30_000);
   });
 
   test("job caps client collect waits under the broker's relay timeout", async () => {
     const { bridge, calls } = recordingBridge(() => ({ status: "running" }));
-    const text = await call(bridge, "job", { action: "collect", handle: "client@Player1:2", wait_ms: 60_000 });
+    const text = await call(bridge, "job", { action: "collect", handle: "client@Player1:2.1a2b3c4d", wait_ms: 60_000 });
     expect(calls[0]!.args).toMatchObject({ context: "client", player: "Player1", wait_ms: 8_000 });
     expect(text).toContain("still running (client waits cap at 8000ms)");
   });
 
   test("job reports a cancelled job with its reason", async () => {
     const { bridge } = recordingBridge(() => ({ status: "cancelled", vm: "plugin", err: "superseded by job 9 (key sampler)" }));
-    const text = await call(bridge, "job", { action: "poll", handle: "edit:4" });
-    expect(text).toBe("job edit:4 cancelled\tvm=plugin\nERR superseded by job 9 (key sampler)");
+    const text = await call(bridge, "job", { action: "poll", handle: "edit:4.1a2b3c4d" });
+    expect(text).toBe("job edit:4.1a2b3c4d cancelled\tvm=plugin\nERR superseded by job 9 (key sampler)");
   });
 
   test("job list renders handles for the given context", async () => {
-    const { bridge } = recordingBridge(() => ({ jobs: [{ id: "2", status: "running", vm: "game", key: "s", elapsed: 3 }] }));
+    const { bridge } = recordingBridge(() => ({ jobs: [{ id: "2", status: "running", vm: "game", key: "s", elapsed: 3 }], nonce: "1a2b3c4d" }));
     expect(await call(bridge, "job", { action: "list", context: "server" })).toBe(
-      "server:2\tstatus=running vm=game key=s elapsed_s=3",
+      "server:2.1a2b3c4d\tstatus=running vm=game key=s elapsed_s=3",
     );
   });
 

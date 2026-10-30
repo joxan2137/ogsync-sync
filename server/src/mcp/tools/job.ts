@@ -9,6 +9,7 @@ const WAIT_MARGIN_MS = 5_000;
 
 interface ListResult {
   jobs?: Array<{ id: string; gen?: number; key?: string; vm?: string; status?: string; elapsed?: number }>;
+  nonce?: string;
 }
 
 export const tool = defineTool({
@@ -34,7 +35,7 @@ export const tool = defineTool({
       )) as ListResult;
       const player = args.player === undefined ? {} : { player: String(args.player) };
       const rows = (data.jobs ?? []).map((j) =>
-        row(formatHandle({ context, ...player, id: j.id }), {
+        row(formatHandle({ context, ...player, id: j.id, nonce: String(data.nonce) }), {
           status: j.status,
           vm: j.vm,
           key: j.key,
@@ -46,7 +47,7 @@ export const tool = defineTool({
 
     if (!args.handle) throw badArg(`action=${action} needs a handle from run async=true`);
     const handle = parseHandle(args.handle);
-    if (!handle) throw badArg(`bad handle '${args.handle}' (expected server:7 or client@Player1:3)`);
+    if (!handle) throw badArg(`bad handle '${args.handle}' (expected the handle run printed, e.g. server:7.1a2b3c4d)`);
     let waitMs = action === "collect" ? (args.wait_ms ?? 10_000) : 0;
     const clamped = handle.context === "client" && waitMs > CLIENT_WAIT_CAP_MS;
     if (clamped) waitMs = CLIENT_WAIT_CAP_MS;
@@ -54,7 +55,7 @@ export const tool = defineTool({
     const opts = callOpts(args);
     const data = (await bridge.call(
       "run.job",
-      { action, id: handle.id, context: handle.context, player: handle.player, wait_ms: waitMs },
+      { action, id: handle.id, nonce: handle.nonce, context: handle.context, player: handle.player, wait_ms: waitMs },
       { ...opts, timeoutMs: Math.max(opts.timeoutMs ?? 0, waitMs + WAIT_MARGIN_MS) },
     )) as RunResult;
 

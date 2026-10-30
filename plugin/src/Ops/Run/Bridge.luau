@@ -9,6 +9,9 @@ local HttpService = game:GetService("HttpService")
 
 local ENCODE_DEPTH = 4
 local MAX_OUTPUT_BYTES = 100 * 1024
+-- Finished evals stay cancellable (their ogsync.delay timers can still be
+-- disarmed by a superseding job) for this many newer evals.
+local MAX_ARMED = 64
 
 type Run = {
 	status: string,
@@ -21,10 +24,23 @@ type Run = {
 	waiter: thread?,
 }
 
+type Arm = { cancelled: boolean }
+
 return function(host: Instance, serde: any)
 	local invoke = host:WaitForChild("Invoke") :: BindableFunction
 	local running: { [string]: Run } = {}
-	local cancelled: { [string]: boolean } = {}
+	local armed: { [string]: Arm } = {}
+	local armedOrder: { string } = {}
+
+	local function arm(id: string): Arm
+		local state: Arm = { cancelled = false }
+		armed[id] = state
+		table.insert(armedOrder, id)
+		if #armedOrder > MAX_ARMED then
+			armed[table.remove(armedOrder, 1) :: string] = nil
+		end
+		return state
+	end
 
 	local function encodeValue(value: any): any
 		local ok, encoded = pcall(serde.encode, value, ENCODE_DEPTH)
@@ -90,15 +106,16 @@ return function(host: Instance, serde: any)
 
 	local function exec(id: string, gen: number, module: ModuleScript): string
 		local run: Run = { status = "running", output = {}, bytes = 0, dropped = 0 }
+		local state = arm(id)
 		local context = {
 			id = id,
 			gen = gen,
 			alive = function(): boolean
-				return not cancelled[id]
+				return not state.cancelled
 			end,
 			delay = function(seconds: number, fn: (...any) -> ...any, ...: any): thread
 				return task.delay(seconds, function(...)
-					if not cancelled[id] then
+					if not state.cancelled then
 						fn(...)
 					end
 				end, ...)
@@ -114,6 +131,11 @@ return function(host: Instance, serde: any)
 			return reply(run)
 		end
 
+		-- A cancel can arrive while require() compiles the module.
+		if state.cancelled then
+			settle(run, "cancelled", "cancelled by request")
+			return reply(run)
+		end
 		running[id] = run
 		run.thread = task.spawn(function()
 			local results = table.pack(xpcall(entry, function(err: any): string
@@ -138,7 +160,11 @@ return function(host: Instance, serde: any)
 	end
 
 	local function cancel(id: string)
-		cancelled[id] = true
+		local state = armed[id]
+		if state ~= nil then
+			state.cancelled = true
+			armed[id] = nil
+		end
 		local run = running[id]
 		if run == nil or run.status ~= "running" then
 			return

@@ -1,6 +1,7 @@
 // Eval job handles and the result rendering `run` and `job` share. A handle
-// names the session that owns the job, so `job` can route back to it:
-// `server:7`, `edit:3`, `client:2` or `client@Player1:2`.
+// names the session that owns the job, so `job` can route back to it, plus that
+// session's registry nonce, because job ids restart at 1 in every play
+// DataModel: `server:7.1a2b3c4d`, `client@Player1:2.1a2b3c4d`.
 
 import { clip, fmtValue, moreLine } from "./fmt.ts";
 
@@ -12,6 +13,7 @@ export interface JobHandle {
   context: RunContext;
   player?: string;
   id: string;
+  nonce: string;
 }
 
 export interface RunResult {
@@ -23,6 +25,7 @@ export interface RunResult {
   context?: string;
   job?: string;
   gen?: number;
+  nonce?: string;
   key?: string;
   status?: string;
   elapsed?: number;
@@ -31,15 +34,15 @@ export interface RunResult {
 
 export function formatHandle(handle: JobHandle): string {
   const owner = handle.player === undefined ? handle.context : `${handle.context}@${handle.player}`;
-  return `${owner}:${handle.id}`;
+  return `${owner}:${handle.id}.${handle.nonce}`;
 }
 
 export function parseHandle(text: string): JobHandle | null {
-  const m = /^(edit|server|client)(?:@([^:]+))?:(\w+)$/.exec(text.trim());
+  const m = /^(edit|server|client)(?:@([^:]+))?:(\d+)\.([0-9a-z]+)$/.exec(text.trim());
   if (!m) return null;
-  const [, context, player, id] = m;
+  const [, context, player, id, nonce] = m;
   if (player !== undefined && context !== "client") return null;
-  return { context: context as RunContext, ...(player === undefined ? {} : { player }), id: id! };
+  return { context: context as RunContext, ...(player === undefined ? {} : { player }), id: id!, nonce: nonce! };
 }
 
 /** Print output, `=> value` returns, then drop/truncation notes. */

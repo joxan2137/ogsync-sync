@@ -32,6 +32,7 @@ export const tool = defineTool({
         context,
         ...(args.player === undefined ? {} : { player: String(args.player) }),
         id: String(data.job),
+        nonce: String(data.nonce),
       });
       return `job ${handle} started vm=${data.vm ?? "?"} gen=${data.gen ?? "?"}${data.key ? ` key=${data.key}` : ""}\npoll, collect or cancel with the job tool: handle="${handle}"`;
     }

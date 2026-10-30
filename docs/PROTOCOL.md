@@ -106,15 +106,23 @@ first). Anything else goes to the bound edit session.
   Synchronous result: `{id, gen, key?, vm, context, status: "done", elapsed,
   output: [{level, text}], dropped, truncated, returns}`; a failed eval is an
   error whose message ends in ` [vm=game|plugin]` plus the captured output.
-  `async: true` answers at once with `{job, gen, key?, vm, context, async: true}`.
-- `run.job {action: "poll"|"collect"|"cancel"|"list", id?, wait_ms?, context,
-  player?}` → the same snapshot shape (`status`: `running`|`done`|`error`|
+  `async: true` answers at once with `{job, gen, nonce, key?, vm, context,
+  async: true}`. `nonce` is 8 hex chars generated per plugin load (so per play
+  DataModel); the daemon puts it in the handle.
+- `run.job {action: "poll"|"collect"|"cancel"|"list", id?, nonce?, wait_ms?,
+  context, player?}` → the same snapshot shape (plus `nonce`); a `nonce` other
+  than the session's is refused, because ids restart at 1 per DataModel. `list`
+  answers `{jobs, nonce}`. Snapshot shape (`status`: `running`|`done`|`error`|
   `cancelled`, `err` for the last two), or `{jobs: [{id, gen, key, vm, context,
   status, elapsed}]}` for `list`. `collect` waits up to `wait_ms` and drops a
   settled job; the daemon sets the call timeout above `wait_ms`.
 - Generations: ids are the per-session generation counter. A job started with
   the `key` of an earlier job cancels it; `ogsync.delay` timers and a late
-  finish from a cancelled or superseded job are dropped.
+  finish from a cancelled or superseded job are dropped. The bridge keeps the
+  cancel switch of the 64 most recent game-VM evals, so a superseding job can
+  still disarm timers armed by one that already returned.
+- Recorded writes (see Place writes) run one at a time in the plugin, so one
+  op's Cancel cannot roll back another op's write that landed while it yielded.
 - Game-VM transport (plugin ⇄ injected bridge, same DataModel): one
   `BindableFunction` `Invoke` under the bridge script. Messages
   `{kind: "exec", id, gen, module}` (blocks until settled), `{kind: "peek", id}`

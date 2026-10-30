@@ -33,12 +33,12 @@ local Jobs = {}
 Jobs.__index = Jobs
 
 export type Registry = typeof(setmetatable(
-	{} :: { generation: number, jobs: { [string]: Job }, current: { [string]: Job } },
+	{} :: { nonce: string, generation: number, jobs: { [string]: Job }, current: { [string]: Job } },
 	Jobs
 ))
 
-function Jobs.new(): Registry
-	return setmetatable({ generation = 0, jobs = {}, current = {} }, Jobs)
+function Jobs.new(nonce: string): Registry
+	return setmetatable({ nonce = nonce, generation = 0, jobs = {}, current = {} }, Jobs)
 end
 
 function Jobs.start(self: Registry, spec: Spec): Job
@@ -159,10 +159,11 @@ function Jobs.take(self: Registry, id: string): Job?
 	return job
 end
 
-function Jobs.snapshot(_self: Registry, job: Job): any
+function Jobs.snapshot(self: Registry, job: Job): any
 	return {
 		id = job.id,
 		gen = job.gen,
+		nonce = self.nonce,
 		key = job.key,
 		vm = job.vm,
 		context = job.context,
